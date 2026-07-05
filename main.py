@@ -1,8 +1,10 @@
 import os
 import re
 import logging
+import inspect
 import httpx
 import asyncio
+
 
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.google import GoogleProvider
@@ -57,8 +59,43 @@ async def _get_all_runbooks() -> list[dict]:
     return runbooks
 
 
-async def _run_runbook(runbook_id: str, environment_id: str) -> dict:
-    """Trigger a runbook run and poll for completion, returning the final task status."""
+async def _get_project_prompted_variables(project_id: str) -> list[dict]:
+    """Fetch prompted variables for a project."""
+    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=_octopus_headers()) as client:
+        variable_set_id = f"variableset-{project_id}"
+        resp = await client.get(f"/api/{OCTOPUS_SPACE_ID}/variables/{variable_set_id}")
+        resp.raise_for_status()
+        data = resp.json()
+        prompted = []
+        for var in data.get("Variables", []):
+            prompt = var.get("Prompt")
+            if prompt:
+                prompted.append({
+                    "id": var["Id"],
+                    "name": var["Name"],
+                    "label": prompt.get("Label", var["Name"]),
+                    "description": prompt.get("Description", ""),
+                    "required": prompt.get("Required", False),
+                    "default": var.get("Value", ""),
+                })
+        return prompted
+
+
+def _sanitize_param_name(name: str) -> str:
+    """Convert a variable name into a valid Python parameter name."""
+    sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", name)
+    sanitized = re.sub(r"^[0-9]", "_", sanitized)
+    return sanitized.strip("_").lower()
+
+
+async def _run_runbook(runbook_id: str, environment_id: str, variable_values: dict[str, str] | None = None) -> dict:
+    """Trigger a runbook run and poll for completion, returning the final task status.
+
+    Args:
+        runbook_id: The runbook to run
+        environment_id: The environment to run in
+        variable_values: Dict mapping variable names to their values for prompted variables
+    """
     async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=_octopus_headers()) as client:
         # Get the published runbook snapshot
         resp = await client.get(f"/api/{OCTOPUS_SPACE_ID}/runbooks/{runbook_id}")
@@ -68,12 +105,58 @@ async def _run_runbook(runbook_id: str, environment_id: str) -> dict:
         if not snapshot_id:
             return {"status": "Failed", "error": "Runbook has no published snapshot"}
 
+        # Build FormValues by resolving variable names to form element IDs from the snapshot preview
+        form_values = {}
+        if variable_values:
+            resp = await client.get(
+                f"/api/{OCTOPUS_SPACE_ID}/runbookSnapshots/{snapshot_id}/runbookRuns/preview/{environment_id}"
+            )
+            resp.raise_for_status()
+            preview = resp.json()
+            form = preview.get("Form", {})
+            elements = form.get("Elements", [])
+
+            # Start with default form values from the preview
+            form_values = dict(form.get("Values", {}))
+
+            logger.info(f"Form elements: {[(e.get('Name'), e.get('Control', {})) for e in elements]}")
+            logger.info(f"Form default values: {form.get('Values', {})}")
+
+            # Map variable names to form element IDs and override defaults
+            for element in elements:
+                element_id = element.get("Name", "")
+                control = element.get("Control", {})
+                control_label = control.get("Label", "")
+                control_name = control.get("Name", "")
+                control_description = control.get("Description", "")
+
+                for var_name, var_value in variable_values.items():
+                    # Try matching by control label, control name, element ID, or description
+                    if var_name in (control_label, control_name, element_id, control_description):
+                        form_values[element_id] = var_value
+                        logger.info(f"Mapped variable '{var_name}' to form element '{element_id}' = '{var_value}'")
+                        break
+
+            if variable_values and not any(
+                var_name in (e.get("Control", {}).get("Label", ""), e.get("Control", {}).get("Name", ""), e.get("Name", ""))
+                for e in elements
+                for var_name in variable_values.keys()
+            ):
+                logger.warning(
+                    f"Could not map any variables to form elements. "
+                    f"Variables: {list(variable_values.keys())}, "
+                    f"Elements: {[(e.get('Name'), e.get('Control', {}).get('Label'), e.get('Control', {}).get('Name')) for e in elements]}"
+                )
+
         # Create the runbook run
         payload = {
             "RunbookId": runbook_id,
             "RunbookSnapshotId": snapshot_id,
             "EnvironmentId": environment_id,
         }
+        if form_values:
+            payload["FormValues"] = form_values
+
         resp = await client.post(
             f"/api/{OCTOPUS_SPACE_ID}/runbookRuns",
             json=payload,
@@ -116,7 +199,7 @@ async def _get_environments() -> list[dict]:
         return resp.json().get("Items", [])
 
 
-def _register_runbook_tool(runbook: dict, environments: list[dict]) -> None:
+def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_variables: list[dict]) -> None:
     """Register a single runbook as an MCP tool with task support."""
     runbook_id = runbook["Id"]
     runbook_name = runbook["Name"]
@@ -125,14 +208,37 @@ def _register_runbook_tool(runbook: dict, environments: list[dict]) -> None:
     tool_name = f"run_runbook_{_sanitize_tool_name(runbook_name)}"
 
     logger.info(
-        f"Registering runbook tool: {tool_name} (runbook_id={runbook_id}, project_id={project_id})"
+        f"Registering runbook tool: {tool_name} (runbook_id={runbook_id}, project_id={project_id}, "
+        f"prompted_variables={[v['name'] for v in prompted_variables]})"
     )
 
     env_names = [e["Name"] for e in environments]
     env_help = ", ".join(env_names) if env_names else "No environments found"
 
-    async def run_tool(environment_name: str) -> dict:
+    # Build a mapping from sanitized param name to variable info
+    param_to_var = {}
+    for var in prompted_variables:
+        param_name = _sanitize_param_name(var["name"])
+        param_to_var[param_name] = var
+
+    # Build function parameters dynamically
+    params = [
+        inspect.Parameter("environment_name", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=str),
+    ]
+    for param_name, var in param_to_var.items():
+        default = var["default"] if var["default"] else (inspect.Parameter.empty if var["required"] else None)
+        params.append(
+            inspect.Parameter(
+                param_name,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                default=default,
+                annotation=str | None if not var["required"] else str,
+            )
+        )
+
+    async def run_tool(**kwargs) -> dict:
         """placeholder"""
+        environment_name = kwargs["environment_name"]
         # Resolve environment name to ID
         env_map = {e["Name"].lower(): e["Id"] for e in environments}
         env_id: str | None = env_map.get(environment_name.lower())
@@ -141,17 +247,41 @@ def _register_runbook_tool(runbook: dict, environments: list[dict]) -> None:
                 "status": "Failed",
                 "error": f"Environment '{environment_name}' not found. Available: {env_help}",
             }
-        return await _run_runbook(runbook_id, env_id)
 
-    # Set the docstring dynamically for the tool description
+        # Build variable values from prompted variable arguments (keyed by variable name)
+        variable_values = {}
+        for param_name, var in param_to_var.items():
+            value = kwargs.get(param_name)
+            if value is not None:
+                variable_values[var["name"]] = value
+
+        return await _run_runbook(runbook_id, env_id, variable_values if variable_values else None)
+
+    # Build docstring with prompted variable info
+    args_doc = "    environment_name: The name of the environment to run the runbook in\n"
+    for param_name, var in param_to_var.items():
+        required_str = " (required)" if var["required"] else " (optional)"
+        var_desc = var["description"] or var["label"]
+        args_doc += f"    {param_name}: {var_desc}{required_str}\n"
+
     run_tool.__doc__ = (
         f"{description}\n\n"
         f"Project ID: {project_id}\n"
         f"Available environments: {env_help}\n\n"
         f"Args:\n"
-        f"    environment_name: The name of the environment to run the runbook in"
+        f"{args_doc}"
     )
     run_tool.__name__ = tool_name
+
+    # Apply the dynamic signature and annotations
+    sig = inspect.Signature(params)
+    run_tool.__signature__ = sig
+
+    # Set __annotations__ so that typing.get_type_hints() can resolve them
+    annotations = {"environment_name": str, "return": dict}
+    for param_name, var in param_to_var.items():
+        annotations[param_name] = str | None if not var["required"] else str
+    run_tool.__annotations__ = annotations
 
     mcp.tool(name=tool_name, description=description, task=True)(run_tool)
 
@@ -162,8 +292,17 @@ async def register_all_runbook_tools() -> None:
         _get_all_runbooks(),
         _get_environments(),
     )
+
+    # Fetch prompted variables for each unique project
+    project_ids = list({rb.get("ProjectId", "") for rb in runbooks if rb.get("ProjectId")})
+    project_vars = await asyncio.gather(
+        *[_get_project_prompted_variables(pid) for pid in project_ids]
+    )
+    project_prompted_vars = dict(zip(project_ids, project_vars))
+
     for runbook in runbooks:
-        _register_runbook_tool(runbook, environments)
+        prompted = project_prompted_vars.get(runbook.get("ProjectId", ""), [])
+        _register_runbook_tool(runbook, environments, prompted)
 
 
 # Register tools at import time by running the async setup
