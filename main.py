@@ -89,12 +89,18 @@ async def _run_runbook(runbook_id: str, environment_id: str) -> dict:
             task = resp.json()
             state = task.get("State")
             if state in ("Success", "Failed", "Canceled", "TimedOut"):
+                # Download the task logs
+                log_resp = await client.get(f"/api/tasks/{task_id}/raw")
+                log_resp.raise_for_status()
+                raw_log = log_resp.text
+
                 return {
                     "status": state,
                     "taskId": task_id,
                     "description": task.get("Description", ""),
                     "errorMessage": task.get("ErrorMessage", ""),
                     "duration": task.get("Duration", ""),
+                    "logs": raw_log,
                 }
             await asyncio.sleep(5)
 
