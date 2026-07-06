@@ -363,6 +363,13 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
             )
         )
 
+    # Sort params so that required (no default) come before optional (have default)
+    # Keep ctx first always
+    ctx_params = [p for p in params if p.name == "ctx"]
+    required_params = [p for p in params if p.name != "ctx" and p.default is inspect.Parameter.empty]
+    optional_params = [p for p in params if p.name != "ctx" and p.default is not inspect.Parameter.empty]
+    params = ctx_params + required_params + optional_params
+
     async def run_tool(**kwargs) -> dict:
         """placeholder"""
         ctx = kwargs.pop("ctx", None)
@@ -387,6 +394,20 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
             value = kwargs.get(param_name)
             if value is not None:
                 variable_values[var["name"]] = value
+            elif var["required"] and not var["default"] and ctx:
+                # Elicit the value from the user for required variables with no default
+                var_desc = var["description"] or var["label"]
+                elicit_result = await ctx.elicit(
+                    message=f"Please provide a value for **{var['label']}**\n\n{var_desc}",
+                    response_type=str,
+                )
+                if isinstance(elicit_result, AcceptedElicitation):
+                    variable_values[var["name"]] = elicit_result.data
+                else:
+                    return {
+                        "status": "Failed",
+                        "error": f"Required variable '{var['label']}' was not provided and user declined to supply a value.",
+                    }
 
         return await _run_runbook(runbook_id, env_id, variable_values if variable_values else None, ctx=ctx)
 
