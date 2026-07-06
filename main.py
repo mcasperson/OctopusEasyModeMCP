@@ -6,10 +6,17 @@ import httpx
 import asyncio
 from enum import Enum
 
+from pydantic import BaseModel, Field
 
 from fastmcp import FastMCP, Context
 from fastmcp.server.auth.providers.google import GoogleProvider
 from fastmcp.server.context import AcceptedElicitation
+
+
+class InterventionResponse(BaseModel):
+    """Choose whether to proceed with or abort the deployment, and provide any instructions."""
+    action: str = Field(title="Action", description="Choose whether to proceed with or reject the deployment", json_schema_extra={"enum": ["Proceed", "Reject Deployment"]})
+    instructions: str = Field(default="", title="Instructions", description="Additional instructions or notes for this intervention")
 
 # Octopus Deploy configuration from environment
 OCTOPUS_URL = os.environ["EASY_MODE_MCP_OCTOPUS_URL"]
@@ -251,21 +258,23 @@ async def _run_runbook(runbook_id: str, environment_id: str, variable_values: di
                     responsible_resp.raise_for_status()
                     logger.info(f"Took responsibility for interruption '{interruption['Id']}'")
 
-                    # Then, elicit a response to proceed or abort
+                    # Then, elicit a response to proceed or abort with instructions
                     result = await ctx.elicit(
                         message=message,
-                        response_type=["Proceed", "Reject Deployment"],
-                        response_title="Action",
-                        response_description="Choose whether to proceed with or abort the deployment",
+                        response_type=InterventionResponse,
                     )
 
                     if isinstance(result, AcceptedElicitation):
-                        action = result.data
+                        action = result.data.action
+                        user_instructions = result.data.instructions
                     else:
                         # User declined or cancelled the elicitation - reject the deployment
                         action = "Reject Deployment"
+                        user_instructions = ""
 
                     notes_text = f"Responded via MCP: {action}"
+                    if user_instructions:
+                        notes_text += f"\nInstructions: {user_instructions}"
 
                     submit_payload = {
                         "Instructions": None,
