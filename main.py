@@ -214,6 +214,7 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
 
     env_names = [e["Name"] for e in environments]
     env_help = ", ".join(env_names) if env_names else "No environments found"
+    single_env = len(environments) == 1
 
     # Build a mapping from sanitized param name to variable info
     param_to_var = {}
@@ -222,9 +223,13 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
         param_to_var[param_name] = var
 
     # Build function parameters dynamically
-    params = [
-        inspect.Parameter("environment_name", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=str),
-    ]
+    # If there's only one environment, don't include environment_name as a parameter
+    if single_env:
+        params = []
+    else:
+        params = [
+            inspect.Parameter("environment_name", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=str),
+        ]
     for param_name, var in param_to_var.items():
         default = var["default"] if var["default"] else (inspect.Parameter.empty if var["required"] else None)
         params.append(
@@ -238,7 +243,12 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
 
     async def run_tool(**kwargs) -> dict:
         """placeholder"""
-        environment_name = kwargs["environment_name"]
+        environment_name = kwargs.get("environment_name", environments[0]["Name"] if single_env else None)
+        if not environment_name:
+            return {
+                "status": "Failed",
+                "error": f"Environment name is required. Available: {env_help}",
+            }
         # Resolve environment name to ID
         env_map = {e["Name"].lower(): e["Id"] for e in environments}
         env_id: str | None = env_map.get(environment_name.lower())
@@ -258,7 +268,10 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
         return await _run_runbook(runbook_id, env_id, variable_values if variable_values else None)
 
     # Build docstring with prompted variable info
-    args_doc = "    environment_name: The name of the environment to run the runbook in\n"
+    if single_env:
+        args_doc = ""
+    else:
+        args_doc = "    environment_name: The name of the environment to run the runbook in\n"
     for param_name, var in param_to_var.items():
         required_str = " (required)" if var["required"] else " (optional)"
         var_desc = var["description"] or var["label"]
@@ -278,12 +291,25 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
     run_tool.__signature__ = sig
 
     # Set __annotations__ so that typing.get_type_hints() can resolve them
-    annotations = {"environment_name": str, "return": dict}
+    annotations = {"return": dict}
+    if not single_env:
+        annotations["environment_name"] = str
     for param_name, var in param_to_var.items():
         annotations[param_name] = str | None if not var["required"] else str
     run_tool.__annotations__ = annotations
 
     mcp.tool(name=tool_name, description=description, task=True)(run_tool)
+
+
+async def _get_runbook_environments(runbook: dict) -> list[dict]:
+    """Fetch environments available for a runbook via its RunbookEnvironments link."""
+    environments_link = runbook.get("Links", {}).get("RunbookEnvironments")
+    if not environments_link:
+        return []
+    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=_octopus_headers()) as client:
+        resp = await client.get(environments_link)
+        resp.raise_for_status()
+        return resp.json()
 
 
 async def register_all_runbook_tools() -> None:
@@ -300,9 +326,27 @@ async def register_all_runbook_tools() -> None:
     )
     project_prompted_vars = dict(zip(project_ids, project_vars))
 
+    # Fetch lifecycle environments for runbooks with FromProjectLifecycles scope
+    lifecycle_runbooks = [rb for rb in runbooks if rb.get("EnvironmentScope") == "FromProjectLifecycles"]
+    lifecycle_envs = await asyncio.gather(
+        *[_get_runbook_environments(rb) for rb in lifecycle_runbooks]
+    )
+    lifecycle_env_map = {rb["Id"]: envs for rb, envs in zip(lifecycle_runbooks, lifecycle_envs)}
+
     for runbook in runbooks:
         prompted = project_prompted_vars.get(runbook.get("ProjectId", ""), [])
-        _register_runbook_tool(runbook, environments, prompted)
+
+        # Filter environments based on the runbook's EnvironmentScope
+        scope = runbook.get("EnvironmentScope")
+        if scope == "Specified":
+            allowed_env_ids = set(runbook.get("Environments", []))
+            runbook_environments = [e for e in environments if e["Id"] in allowed_env_ids]
+        elif scope == "FromProjectLifecycles":
+            runbook_environments = lifecycle_env_map.get(runbook["Id"], environments)
+        else:
+            runbook_environments = environments
+
+        _register_runbook_tool(runbook, runbook_environments, prompted)
 
 
 # Register tools at import time by running the async setup
