@@ -97,6 +97,147 @@ def _sanitize_param_name(name: str) -> str:
     return sanitized.strip("_").lower()
 
 
+async def _get_runbook_preview_form(client: httpx.AsyncClient, snapshot_id: str, environment_id: str) -> tuple[list[dict], dict[str, str]]:
+    """Fetch the runbook run preview and return form elements and default values.
+
+    Returns:
+        A tuple of (elements, form_values) where elements is the list of form elements
+        and form_values is a dict of default form values.
+    """
+    resp = await client.get(
+        f"/api/{OCTOPUS_SPACE_ID}/runbookSnapshots/{snapshot_id}/runbookRuns/preview/{environment_id}"
+    )
+    resp.raise_for_status()
+    preview = resp.json()
+    form = preview.get("Form", {})
+    elements = form.get("Elements", [])
+
+    # Start with default form values from the preview
+    form_values = dict(form.get("Values", {}))
+
+    return elements, form_values
+
+
+async def _create_runbook_run(client: httpx.AsyncClient, runbook_id: str, snapshot_id: str, environment_id: str, form_values: dict[str, str]) -> str:
+    """Create a runbook run and return the task ID.
+
+    Args:
+        client: The HTTP client to use
+        runbook_id: The runbook to run
+        snapshot_id: The published runbook snapshot ID
+        environment_id: The environment to run in
+        form_values: Form values to submit with the run
+
+    Returns:
+        The server task ID for the created run.
+    """
+    payload = {
+        "RunbookId": runbook_id,
+        "RunbookSnapshotId": snapshot_id,
+        "EnvironmentId": environment_id,
+    }
+    if form_values:
+        payload["FormValues"] = form_values
+
+    resp = await client.post(
+        f"/api/{OCTOPUS_SPACE_ID}/runbookRuns",
+        json=payload,
+    )
+    resp.raise_for_status()
+    run = resp.json()
+    return run["TaskId"]
+
+
+async def _get_task_raw_log(client: httpx.AsyncClient, task_id: str) -> str:
+    """Download the raw log for a server task.
+
+    Args:
+        client: The HTTP client to use
+        task_id: The server task ID
+
+    Returns:
+        The raw log text.
+    """
+    log_resp = await client.get(f"/api/tasks/{task_id}/raw")
+    log_resp.raise_for_status()
+    return log_resp.text
+
+
+async def _get_task_status(client: httpx.AsyncClient, task_id: str) -> dict:
+    """Fetch a server task and return its JSON representation.
+
+    Args:
+        client: The HTTP client to use
+        task_id: The server task ID to fetch
+
+    Returns:
+        The task JSON dict.
+    """
+    resp = await client.get(f"/api/tasks/{task_id}")
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _get_pending_interruptions(client: httpx.AsyncClient, task_id: str) -> list[dict]:
+    """Fetch pending interruptions for a server task.
+
+    Args:
+        client: The HTTP client to use
+        task_id: The server task ID
+
+    Returns:
+        A list of pending interruption dicts.
+    """
+    resp = await client.get(
+        f"/api/{OCTOPUS_SPACE_ID}/interruptions",
+        params={"regarding": task_id, "pendingOnly": "true"},
+    )
+    resp.raise_for_status()
+    return resp.json().get("Items", [])
+
+
+def _parse_interruption_form(interruption: dict) -> tuple[str, str | None, str | None]:
+    """Parse an interruption's form to extract instructions and element IDs.
+
+    Args:
+        interruption: The interruption JSON dict
+
+    Returns:
+        A tuple of (instructions, notes_element_id, result_element_id).
+    """
+    form = interruption.get("Form", {})
+    elements = form.get("Elements", [])
+    instructions = ""
+    notes_element_id = None
+    result_element_id = None
+    for element in elements:
+        control = element.get("Control", {})
+        control_type = control.get("Type", "")
+        if control_type == "Paragraph":
+            instructions = control.get("Text", "")
+        elif control_type == "TextArea":
+            notes_element_id = element.get("Name", "")
+        elif control_type == "Select":
+            result_element_id = element.get("Name", "")
+    return instructions, notes_element_id, result_element_id
+
+
+async def _get_published_snapshot_id(client: httpx.AsyncClient, runbook_id: str) -> str | None:
+    """Fetch a runbook and return its published snapshot ID.
+
+    Args:
+        client: The HTTP client to use
+        runbook_id: The runbook ID
+
+    Returns:
+        The published runbook snapshot ID, or None if not published.
+    """
+    resp = await client.get(f"/api/{OCTOPUS_SPACE_ID}/runbooks/{runbook_id}")
+    resp.raise_for_status()
+    runbook = resp.json()
+    return runbook.get("PublishedRunbookSnapshotId")
+
+
 async def _run_runbook(runbook_id: str, environment_id: str, variable_values: dict[str, str] | None = None, ctx: Context | None = None) -> dict:
     """Trigger a runbook run and poll for completion, returning the final task status.
 
@@ -108,29 +249,17 @@ async def _run_runbook(runbook_id: str, environment_id: str, variable_values: di
     """
     async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=_octopus_headers()) as client:
         # Get the published runbook snapshot
-        resp = await client.get(f"/api/{OCTOPUS_SPACE_ID}/runbooks/{runbook_id}")
-        resp.raise_for_status()
-        runbook = resp.json()
-        snapshot_id = runbook.get("PublishedRunbookSnapshotId")
+        snapshot_id = await _get_published_snapshot_id(client, runbook_id)
         if not snapshot_id:
             return {"status": "Failed", "error": "Runbook has no published snapshot"}
 
         # Build FormValues by resolving variable names to form element IDs from the snapshot preview
         form_values = {}
         if variable_values:
-            resp = await client.get(
-                f"/api/{OCTOPUS_SPACE_ID}/runbookSnapshots/{snapshot_id}/runbookRuns/preview/{environment_id}"
-            )
-            resp.raise_for_status()
-            preview = resp.json()
-            form = preview.get("Form", {})
-            elements = form.get("Elements", [])
-
-            # Start with default form values from the preview
-            form_values = dict(form.get("Values", {}))
+            elements, form_values = await _get_runbook_preview_form(client, snapshot_id, environment_id)
 
             logger.info(f"Form elements: {[(e.get('Name'), e.get('Control', {})) for e in elements]}")
-            logger.info(f"Form default values: {form.get('Values', {})}")
+            logger.info(f"Form default values: {form_values}")
 
             # Map variable names to form element IDs and override defaults
             for element in elements:
@@ -159,33 +288,15 @@ async def _run_runbook(runbook_id: str, environment_id: str, variable_values: di
                 )
 
         # Create the runbook run
-        payload = {
-            "RunbookId": runbook_id,
-            "RunbookSnapshotId": snapshot_id,
-            "EnvironmentId": environment_id,
-        }
-        if form_values:
-            payload["FormValues"] = form_values
-
-        resp = await client.post(
-            f"/api/{OCTOPUS_SPACE_ID}/runbookRuns",
-            json=payload,
-        )
-        resp.raise_for_status()
-        run = resp.json()
-        task_id = run["TaskId"]
+        task_id = await _create_runbook_run(client, runbook_id, snapshot_id, environment_id, form_values)
 
         # Poll the server task until completion
         while True:
-            resp = await client.get(f"/api/tasks/{task_id}")
-            resp.raise_for_status()
-            task = resp.json()
+            task = await _get_task_status(client, task_id)
             state = task.get("State")
             if state in ("Success", "Failed", "Canceled", "TimedOut"):
                 # Download the task logs
-                log_resp = await client.get(f"/api/tasks/{task_id}/raw")
-                log_resp.raise_for_status()
-                raw_log = log_resp.text
+                raw_log = await _get_task_raw_log(client, task_id)
 
                 return {
                     "status": state,
@@ -198,12 +309,7 @@ async def _run_runbook(runbook_id: str, environment_id: str, variable_values: di
 
             # Check for pending manual interventions
             if task.get("HasPendingInterruptions") and ctx:
-                interruptions_resp = await client.get(
-                    f"/api/{OCTOPUS_SPACE_ID}/interruptions",
-                    params={"regarding": task_id, "pendingOnly": "true"},
-                )
-                interruptions_resp.raise_for_status()
-                interruptions = interruptions_resp.json().get("Items", [])
+                interruptions = await _get_pending_interruptions(client, task_id)
 
                 for interruption in interruptions:
                     if not interruption.get("IsPending"):
@@ -212,20 +318,7 @@ async def _run_runbook(runbook_id: str, environment_id: str, variable_values: di
                     logger.info(f"Interruption details: {interruption}")
 
                     # Extract intervention instructions from the form
-                    form = interruption.get("Form", {})
-                    elements = form.get("Elements", [])
-                    instructions = ""
-                    notes_element_id = None
-                    result_element_id = None
-                    for element in elements:
-                        control = element.get("Control", {})
-                        control_type = control.get("Type", "")
-                        if control_type == "Paragraph":
-                            instructions = control.get("Text", "")
-                        elif control_type == "TextArea":
-                            notes_element_id = element.get("Name", "")
-                        elif control_type == "Select":
-                            result_element_id = element.get("Name", "")
+                    instructions, notes_element_id, result_element_id = _parse_interruption_form(interruption)
 
                     # Build the elicitation message
                     title = interruption.get("Title", "Manual Intervention")
