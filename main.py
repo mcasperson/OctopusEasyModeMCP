@@ -5,6 +5,7 @@ import inspect
 import httpx
 import asyncio
 from enum import Enum
+from contextlib import asynccontextmanager
 
 from pydantic import BaseModel, Field
 
@@ -36,7 +37,30 @@ auth = GoogleOidcProvider(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("OctopusEasyMode", auth=auth)
+
+async def _periodic_refresh() -> None:
+    """Periodically re-register all runbook tools every 5 minutes."""
+    while True:
+        await asyncio.sleep(300)  # 5 minutes
+        try:
+            logger.info("Refreshing runbook tools...")
+            await register_all_runbook_tools()
+            logger.info("Runbook tools refreshed successfully.")
+        except Exception as e:
+            logger.error(f"Failed to refresh runbook tools: {e}")
+
+
+@asynccontextmanager
+async def _app_lifespan(app: FastMCP):
+    """Start the periodic refresh background task on server startup."""
+    task = asyncio.create_task(_periodic_refresh())
+    try:
+        yield
+    finally:
+        task.cancel()
+
+
+mcp = FastMCP("OctopusEasyMode", auth=auth, lifespan=_app_lifespan)
 
 
 async def exchange_token_for_octopus_token(id_token: str) -> str:
@@ -613,8 +637,20 @@ async def _get_runbook_environments(runbook: dict) -> list[dict]:
         return resp.json()
 
 
+async def _remove_all_tools() -> None:
+    """Remove all currently registered tools from the MCP server."""
+    tools = await mcp.list_tools()
+    for tool in tools:
+        try:
+            mcp.remove_tool(tool.name)
+        except Exception as e:
+            logger.warning(f"Failed to remove tool '{tool.name}': {e}")
+
+
 async def register_all_runbook_tools() -> None:
     """Fetch runbooks and environments, then register each runbook as a tool."""
+    await _remove_all_tools()
+
     runbooks, environments = await asyncio.gather(
         _get_all_runbooks(),
         _get_environments(),
