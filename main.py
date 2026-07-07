@@ -7,13 +7,12 @@ import asyncio
 from enum import Enum
 from contextlib import asynccontextmanager
 
+from fastmcp.server.auth.providers.google import GoogleProvider
+from fastmcp.server.dependencies import get_access_token
 from pydantic import BaseModel, Field
 
 from fastmcp import FastMCP, Context
 from fastmcp.server.context import AcceptedElicitation
-
-from oidc_google_provider import GoogleOidcProvider
-from oidc_dependencies import get_oidc_access_token
 
 
 class InterventionResponse(BaseModel):
@@ -27,7 +26,7 @@ OCTOPUS_API_KEY = os.environ["EASY_MODE_MCP_OCTOPUS_API_KEY"]
 OCTOPUS_SPACE_ID = os.environ["EASY_MODE_MCP_OCTOPUS_SPACE_ID"]
 
 # Google OAuth configuration
-auth = GoogleOidcProvider(
+auth = GoogleProvider(
     client_id=os.environ["EASY_MODE_MCP_GOOGLE_CLIENT_ID"],
     client_secret=os.environ["EASY_MODE_MCP_GOOGLE_CLIENT_SECRET"],
     base_url=os.environ.get("EASY_MODE_MCP_BASE_URL", "http://localhost:8000"),
@@ -345,7 +344,7 @@ async def _run_runbook(runbook_id: str, environment_id: str, variable_values: di
         ctx: MCP context for elicitation during manual interventions
     """
     # Exchange the user's Google ID token for an Octopus access token
-    google_access_token = get_oidc_access_token()
+    google_access_token = get_access_token()
 
     access_token = await exchange_token_for_octopus_token(google_access_token.id_token)
 
