@@ -471,7 +471,7 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
     runbook_name = runbook["Name"]
     project_id = runbook.get("ProjectId", "")
     description = runbook.get("Description") or f"Run the '{runbook_name}' runbook"
-    tool_name = f"run_runbook_{_sanitize_tool_name(runbook_name)}"
+    tool_name = _sanitize_tool_name(runbook_name)
 
     logger.info(
         f"Registering runbook tool: {tool_name} (runbook_id={runbook_id}, project_id={project_id}, "
