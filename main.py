@@ -13,7 +13,7 @@ from fastmcp.server.auth.providers.google import GoogleProvider
 from fastmcp.server.context import AcceptedElicitation
 from fastmcp.server.dependencies import get_access_token
 
-from GoogleOidcProvider import GoogleOidcProvider
+from oidc_google_provider import GoogleOidcProvider
 from oidc_dependencies import get_oidc_access_token
 
 
@@ -323,9 +323,11 @@ async def _run_runbook(runbook_id: str, environment_id: str, variable_values: di
         ctx: MCP context for elicitation during manual interventions
     """
     # Exchange the user's Google ID token for an Octopus access token
-    bearer_token = get_oidc_access_token()
+    google_access_token = get_oidc_access_token()
 
-    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=_octopus_headers(bearer_token.id_token)) as client:
+    access_token = await exchange_token_for_octopus_token(google_access_token.id_token)
+
+    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=_octopus_headers(access_token)) as client:
         # Get the published runbook snapshot
         snapshot_id = await _get_published_snapshot_id(client, runbook_id)
         if not snapshot_id:
