@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from fastmcp import FastMCP, Context
 from fastmcp.server.auth.providers.google import GoogleProvider
 from fastmcp.server.context import AcceptedElicitation
+from fastmcp.server.dependencies import get_access_token
 
 
 class InterventionResponse(BaseModel):
@@ -37,7 +38,45 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP("OctopusEasyMode", auth=auth)
 
 
-def _octopus_headers() -> dict[str, str]:
+async def exchange_token_for_octopus_token(id_token: str) -> str:
+    """Exchange a Google ID token for an Octopus access token via token exchange.
+
+    Args:
+        id_token: The Google ID token (JWT) to exchange.
+
+    Returns:
+        The Octopus access token.
+
+    Raises:
+        RuntimeError: If the token exchange fails or no access token is returned.
+    """
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{OCTOPUS_URL}/token/v1",
+            json={
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "audience": os.environ["EASY_MODE_MCP_OCTOPUS_AUDIENCE"],
+                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                "subject_token": id_token,
+            },
+        )
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Token exchange failed with status {response.status_code}: {response.text}"
+            )
+
+        token_data = response.json()
+
+        if not token_data.get("access_token"):
+            raise RuntimeError("Authentication error: Unable to get Octopus token")
+
+        return token_data["access_token"]
+
+
+def _octopus_headers(bearer_token: str | None = None) -> dict[str, str]:
+    if bearer_token:
+        return {"Authorization": f"Bearer {bearer_token}"}
     return {"X-Octopus-ApiKey": OCTOPUS_API_KEY}
 
 
@@ -280,7 +319,36 @@ async def _run_runbook(runbook_id: str, environment_id: str, variable_values: di
         variable_values: Dict mapping variable names to their values for prompted variables
         ctx: MCP context for elicitation during manual interventions
     """
-    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=_octopus_headers()) as client:
+    # Exchange the user's Google ID token for an Octopus access token
+    bearer_token = None
+
+    # Extract the request context
+    req_ctx = getattr(ctx, "request_context", None)
+    if not req_ctx:
+        return {"status": "Failed", "error": "No request context found. Ensure the user is authenticated."}
+
+    # FIX: meta is an object, not a dict! Use getattr or dot-notation.
+    meta = getattr(req_ctx, "meta", None)
+    if not meta:
+        return {"status": "Failed", "error": "No request context meta found. Ensure the user is authenticated."}
+
+    # Extract the auth session object from meta attributes
+    session = getattr(meta, "auth_session", None)
+    if not session:
+        return {"status": "Failed", "error": "No auth session found. Ensure the user is authenticated."}
+
+    # If session is also an object/Pydantic model, use getattr on it too
+    if hasattr(session, "id_token"):
+        id_token = session.id_token
+    elif isinstance(session, dict):
+        id_token = session.get("id_token")
+    else:
+        id_token = getattr(session, "id_token", None)
+
+    if id_token:
+        bearer_token = await exchange_token_for_octopus_token(id_token)
+
+    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=_octopus_headers(bearer_token)) as client:
         # Get the published runbook snapshot
         snapshot_id = await _get_published_snapshot_id(client, runbook_id)
         if not snapshot_id:
