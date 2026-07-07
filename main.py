@@ -656,6 +656,9 @@ async def register_all_runbook_tools() -> None:
         _get_environments(),
     )
 
+    # Only include runbooks that have a published snapshot
+    runbooks = [rb for rb in runbooks if rb.get("PublishedRunbookSnapshotId")]
+
     # Fetch prompted variables for each unique project
     project_ids = list({rb.get("ProjectId", "") for rb in runbooks if rb.get("ProjectId")})
     project_vars = await asyncio.gather(
