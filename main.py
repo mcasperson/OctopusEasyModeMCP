@@ -9,9 +9,7 @@ from enum import Enum
 from pydantic import BaseModel, Field
 
 from fastmcp import FastMCP, Context
-from fastmcp.server.auth.providers.google import GoogleProvider
 from fastmcp.server.context import AcceptedElicitation
-from fastmcp.server.dependencies import get_access_token
 
 from oidc_google_provider import GoogleOidcProvider
 from oidc_dependencies import get_oidc_access_token
