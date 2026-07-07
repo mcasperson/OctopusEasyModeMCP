@@ -196,6 +196,39 @@ async def _get_pending_interruptions(client: httpx.AsyncClient, task_id: str) ->
     return resp.json().get("Items", [])
 
 
+async def _submit_interruption(client: httpx.AsyncClient, interruption_id: str, payload: dict) -> None:
+    """Submit a response to a manual intervention interruption.
+
+    Args:
+        client: The HTTP client to use
+        interruption_id: The interruption ID to submit a response for
+        payload: The submission payload dict
+    """
+    resp = await client.post(
+        f"/api/{OCTOPUS_SPACE_ID}/interruptions/{interruption_id}/submit",
+        json=payload,
+    )
+    if resp.status_code != 200:
+        logger.error(f"Intervention submit failed: {resp.status_code} {resp.text}")
+    resp.raise_for_status()
+
+
+async def _take_interruption_responsibility(client: httpx.AsyncClient, interruption_id: str) -> None:
+    """Take responsibility for a manual intervention interruption.
+
+    Args:
+        client: The HTTP client to use
+        interruption_id: The interruption ID to take responsibility for
+    """
+    resp = await client.put(
+        f"/api/{OCTOPUS_SPACE_ID}/interruptions/{interruption_id}/responsible",
+    )
+    if resp.status_code != 200:
+        logger.error(f"Taking responsibility failed: {resp.status_code} {resp.text}")
+    resp.raise_for_status()
+    logger.info(f"Took responsibility for interruption '{interruption_id}'")
+
+
 def _parse_interruption_form(interruption: dict) -> tuple[str, str | None, str | None]:
     """Parse an interruption's form to extract instructions and element IDs.
 
@@ -343,14 +376,7 @@ async def _run_runbook(runbook_id: str, environment_id: str, variable_values: di
                         }
 
                     # Take responsibility for the interruption
-                    responsible_resp = await client.put(
-                        f"/api/{OCTOPUS_SPACE_ID}/interruptions/{interruption['Id']}/responsible",
-                    )
-                    if responsible_resp.status_code != 200:
-                        logger.error(f"Taking responsibility failed: {responsible_resp.status_code} {responsible_resp.text}")
-                    responsible_resp.raise_for_status()
-                    logger.info(f"Took responsibility for interruption '{interruption['Id']}'")
-
+                    await _take_interruption_responsibility(client, interruption['Id'])
                     # Then, elicit a response to proceed or abort with instructions
                     result = await ctx.elicit(
                         message=message,
@@ -377,14 +403,7 @@ async def _run_runbook(runbook_id: str, environment_id: str, variable_values: di
 
                     logger.info(f"Submitting intervention with payload: {submit_payload}")
 
-
-                    submit_resp = await client.post(
-                        f"/api/{OCTOPUS_SPACE_ID}/interruptions/{interruption['Id']}/submit",
-                        json=submit_payload,
-                    )
-                    if submit_resp.status_code != 200:
-                        logger.error(f"Intervention submit failed: {submit_resp.status_code} {submit_resp.text}")
-                    submit_resp.raise_for_status()
+                    await _submit_interruption(client, interruption['Id'], submit_payload)
                     logger.info(f"Manual intervention '{title}' resolved with: {action}")
 
             await asyncio.sleep(5)
