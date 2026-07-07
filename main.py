@@ -13,6 +13,9 @@ from fastmcp.server.auth.providers.google import GoogleProvider
 from fastmcp.server.context import AcceptedElicitation
 from fastmcp.server.dependencies import get_access_token
 
+from GoogleOidcProvider import GoogleOidcProvider
+from oidc_dependencies import get_oidc_access_token
+
 
 class InterventionResponse(BaseModel):
     """Choose whether to proceed with or abort the deployment, and provide any instructions."""
@@ -25,7 +28,7 @@ OCTOPUS_API_KEY = os.environ["EASY_MODE_MCP_OCTOPUS_API_KEY"]
 OCTOPUS_SPACE_ID = os.environ["EASY_MODE_MCP_OCTOPUS_SPACE_ID"]
 
 # Google OAuth configuration
-auth = GoogleProvider(
+auth = GoogleOidcProvider(
     client_id=os.environ["EASY_MODE_MCP_GOOGLE_CLIENT_ID"],
     client_secret=os.environ["EASY_MODE_MCP_GOOGLE_CLIENT_SECRET"],
     base_url=os.environ.get("EASY_MODE_MCP_BASE_URL", "http://localhost:8000"),
@@ -320,35 +323,9 @@ async def _run_runbook(runbook_id: str, environment_id: str, variable_values: di
         ctx: MCP context for elicitation during manual interventions
     """
     # Exchange the user's Google ID token for an Octopus access token
-    bearer_token = None
+    bearer_token = get_oidc_access_token()
 
-    # Extract the request context
-    req_ctx = getattr(ctx, "request_context", None)
-    if not req_ctx:
-        return {"status": "Failed", "error": "No request context found. Ensure the user is authenticated."}
-
-    # FIX: meta is an object, not a dict! Use getattr or dot-notation.
-    meta = getattr(req_ctx, "meta", None)
-    if not meta:
-        return {"status": "Failed", "error": "No request context meta found. Ensure the user is authenticated."}
-
-    # Extract the auth session object from meta attributes
-    session = getattr(meta, "auth_session", None)
-    if not session:
-        return {"status": "Failed", "error": "No auth session found. Ensure the user is authenticated."}
-
-    # If session is also an object/Pydantic model, use getattr on it too
-    if hasattr(session, "id_token"):
-        id_token = session.id_token
-    elif isinstance(session, dict):
-        id_token = session.get("id_token")
-    else:
-        id_token = getattr(session, "id_token", None)
-
-    if id_token:
-        bearer_token = await exchange_token_for_octopus_token(id_token)
-
-    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=_octopus_headers(bearer_token)) as client:
+    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=_octopus_headers(bearer_token.id_token)) as client:
         # Get the published runbook snapshot
         snapshot_id = await _get_published_snapshot_id(client, runbook_id)
         if not snapshot_id:
