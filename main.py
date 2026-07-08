@@ -7,6 +7,10 @@ import asyncio
 from enum import Enum
 from contextlib import asynccontextmanager
 
+from key_value.aio.stores.azure_tables import AzureTablesStore
+from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+
+from fastmcp.server.auth.providers.azure import AzureProvider
 from fastmcp.server.auth.providers.google import GoogleProvider
 from fastmcp.server.dependencies import get_access_token
 from pydantic import BaseModel, Field
@@ -25,12 +29,24 @@ OCTOPUS_URL = os.environ["EASY_MODE_MCP_OCTOPUS_URL"]
 OCTOPUS_API_KEY = os.environ["EASY_MODE_MCP_OCTOPUS_API_KEY"]
 OCTOPUS_SPACE_ID = os.environ["EASY_MODE_MCP_OCTOPUS_SPACE_ID"]
 
+storage_backend = AzureTablesStore(
+    connection_string=os.environ["EASY_MODE_MCP_AZURE_STORAGE_CONNECTION_STRING"],
+    table_name="mcp_sessions"
+)
+
+encrypted_storage = FernetEncryptionWrapper(
+    key_value=storage_backend,
+    source_material=os.environ["EASY_MODE_MCP_JWT_SIGNING_KEY"],
+    salt="easymode-mcp-storage"
+)
+
 # Google OAuth configuration
 auth = GoogleProvider(
     client_id=os.environ["EASY_MODE_MCP_GOOGLE_CLIENT_ID"],
     client_secret=os.environ["EASY_MODE_MCP_GOOGLE_CLIENT_SECRET"],
     base_url=os.environ.get("EASY_MODE_MCP_BASE_URL", "http://localhost:8000"),
     required_scopes=["openid", "email", "profile"],
+    client_storage=encrypted_storage,
 )
 
 logging.basicConfig(level=logging.INFO)
