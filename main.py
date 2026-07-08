@@ -15,9 +15,10 @@ from pydantic import BaseModel, Field
 
 from fastmcp import FastMCP, Context
 from fastmcp.server.context import AcceptedElicitation
-from key_value.aio.wrappers.prefix_collections import PrefixCollectionsWrapper
 
+base_url = os.environ.get("EASY_MODE_MCP_BASE_URL", "http://localhost:8000")
 
+logging.info(f"Base URL: {base_url}")
 
 class InterventionResponse(BaseModel):
     """Choose whether to proceed with or abort the deployment, and provide any instructions."""
@@ -38,7 +39,7 @@ storage_backend = AzureTablesStore(
 auth = GoogleProvider(
     client_id=os.environ["EASY_MODE_MCP_GOOGLE_CLIENT_ID"],
     client_secret=os.environ["EASY_MODE_MCP_GOOGLE_CLIENT_SECRET"],
-    base_url=os.environ.get("EASY_MODE_MCP_BASE_URL", "http://localhost:8000"),
+    base_url=base_url,
     required_scopes=["openid", "email", "profile"],
     client_storage=storage_backend,
     jwt_signing_key=os.environ["EASY_MODE_MCP_JWT_SIGNING_KEY"],
@@ -704,4 +705,4 @@ asyncio.run(register_all_runbook_tools())
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=8000, allowed_hosts=["*"])
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=8000, allowed_hosts=["*"], allowed_origins=["*"])
