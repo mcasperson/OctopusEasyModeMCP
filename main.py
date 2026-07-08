@@ -31,7 +31,7 @@ OCTOPUS_SPACE_ID = os.environ["EASY_MODE_MCP_OCTOPUS_SPACE_ID"]
 
 storage_backend = AzureTablesStore(
     connection_string=os.environ["EASY_MODE_MCP_AZURE_STORAGE_CONNECTION_STRING"],
-    table_name="mcp_sessions"
+    table_name="mcpsessions"
 )
 
 encrypted_storage = FernetEncryptionWrapper(
