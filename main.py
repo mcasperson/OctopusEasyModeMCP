@@ -7,9 +7,6 @@ import asyncio
 from enum import Enum
 from contextlib import asynccontextmanager
 
-from key_value.aio.stores.azure_tables import AzureTablesStore
-from key_value.aio.stores.azure_tables.store import AzureTablesSanitizationStrategy
-
 from auto_register_provider import AutoRegisterGoogleProvider
 from fastmcp.server.dependencies import get_access_token
 from pydantic import BaseModel, Field
@@ -18,6 +15,9 @@ from fastmcp import FastMCP, Context
 from fastmcp.server.context import AcceptedElicitation
 
 base_url = os.environ.get("EASY_MODE_MCP_BASE_URL", "http://localhost:8000")
+
+# Whether to enable OAuth authentication (set to "false" to disable)
+AUTH_ENABLED = os.environ.get("EASY_MODE_MCP_AUTH_ENABLED", "true").lower() != "false"
 
 logging.info(f"Base URL: {base_url}")
 
@@ -31,22 +31,28 @@ OCTOPUS_URL = os.environ["EASY_MODE_MCP_OCTOPUS_URL"]
 OCTOPUS_API_KEY = os.environ["EASY_MODE_MCP_OCTOPUS_API_KEY"]
 OCTOPUS_SPACE_ID = os.environ["EASY_MODE_MCP_OCTOPUS_SPACE_ID"]
 
-storage_backend = AzureTablesStore(
-    connection_string=os.environ["EASY_MODE_MCP_AZURE_STORAGE_CONNECTION_STRING"],
-    table_name="mcpsessions",
-    key_sanitization_strategy=AzureTablesSanitizationStrategy(),
-    collection_sanitization_strategy=AzureTablesSanitizationStrategy(),
-)
+if AUTH_ENABLED:
+    from key_value.aio.stores.azure_tables import AzureTablesStore
+    from key_value.aio.stores.azure_tables.store import AzureTablesSanitizationStrategy
 
-# Google OAuth configuration
-auth = AutoRegisterGoogleProvider(
-    client_id=os.environ["EASY_MODE_MCP_GOOGLE_CLIENT_ID"],
-    client_secret=os.environ["EASY_MODE_MCP_GOOGLE_CLIENT_SECRET"],
-    base_url=base_url,
-    required_scopes=["openid", "email", "profile"],
-    client_storage=storage_backend,
-    jwt_signing_key=os.environ["EASY_MODE_MCP_JWT_SIGNING_KEY"],
-)
+    storage_backend = AzureTablesStore(
+        connection_string=os.environ["EASY_MODE_MCP_AZURE_STORAGE_CONNECTION_STRING"],
+        table_name="mcpsessions",
+        key_sanitization_strategy=AzureTablesSanitizationStrategy(),
+        collection_sanitization_strategy=AzureTablesSanitizationStrategy(),
+    )
+
+    # Google OAuth configuration
+    auth = AutoRegisterGoogleProvider(
+        client_id=os.environ["EASY_MODE_MCP_GOOGLE_CLIENT_ID"],
+        client_secret=os.environ["EASY_MODE_MCP_GOOGLE_CLIENT_SECRET"],
+        base_url=base_url,
+        required_scopes=["openid", "email", "profile"],
+        client_storage=storage_backend,
+        jwt_signing_key=os.environ["EASY_MODE_MCP_JWT_SIGNING_KEY"],
+    )
+else:
+    auth = None
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -358,12 +364,16 @@ async def _run_runbook(runbook_id: str, environment_id: str, variable_values: di
         variable_values: Dict mapping variable names to their values for prompted variables
         ctx: MCP context for elicitation during manual interventions
     """
-    # Exchange the user's Google ID token for an Octopus access token
-    google_access_token = get_access_token()
+    if AUTH_ENABLED:
+        # Exchange the user's Google ID token for an Octopus access token
+        google_access_token = get_access_token()
+        access_token = await exchange_token_for_octopus_token(google_access_token.id_token)
+        headers = _octopus_headers(access_token)
+    else:
+        # Use API key directly when auth is disabled
+        headers = _octopus_headers()
 
-    access_token = await exchange_token_for_octopus_token(google_access_token.id_token)
-
-    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=_octopus_headers(access_token)) as client:
+    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=headers) as client:
         # Get the published runbook snapshot
         snapshot_id = await _get_published_snapshot_id(client, runbook_id)
         if not snapshot_id:
