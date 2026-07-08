@@ -35,6 +35,11 @@ OCTOPUS_URL = os.environ["EASY_MODE_MCP_OCTOPUS_URL"]
 OCTOPUS_API_KEY = os.environ["EASY_MODE_MCP_OCTOPUS_API_KEY"]
 OCTOPUS_SPACE_ID = os.environ["EASY_MODE_MCP_OCTOPUS_SPACE_ID"]
 
+# Optional: comma-separated list of project names to expose (empty = all projects)
+OCTOPUS_PROJECT_FILTER = [
+    name.strip() for name in os.environ.get("EASY_MODE_MCP_OCTOPUS_PROJECTS", "").split(",") if name.strip()
+]
+
 def _create_auth():
     """Create the OAuth auth provider based on EASY_MODE_MCP_AUTH_TYPE."""
     if AUTH_TYPE == "none":
@@ -723,6 +728,22 @@ async def _remove_all_tools() -> None:
             logger.warning(f"Failed to remove tool '{tool.name}': {e}")
 
 
+async def _get_project_ids_by_names(project_names: list[str]) -> set[str]:
+    """Fetch project IDs for the given project names."""
+    project_ids = set()
+    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=_octopus_headers()) as client:
+        for name in project_names:
+            resp = await client.get(
+                f"/api/{OCTOPUS_SPACE_ID}/projects",
+                params={"partialName": name, "take": 100},
+            )
+            resp.raise_for_status()
+            for project in resp.json().get("Items", []):
+                if project["Name"].lower() == name.lower():
+                    project_ids.add(project["Id"])
+    return project_ids
+
+
 async def register_all_runbook_tools() -> None:
     """Fetch runbooks and environments, then register each runbook as a tool."""
     await _remove_all_tools()
@@ -734,6 +755,12 @@ async def register_all_runbook_tools() -> None:
 
     # Only include runbooks that have a published snapshot
     runbooks = [rb for rb in runbooks if rb.get("PublishedRunbookSnapshotId")]
+
+    # Filter by project names if configured
+    if OCTOPUS_PROJECT_FILTER:
+        allowed_project_ids = await _get_project_ids_by_names(OCTOPUS_PROJECT_FILTER)
+        runbooks = [rb for rb in runbooks if rb.get("ProjectId") in allowed_project_ids]
+        logger.info(f"Filtered to {len(runbooks)} runbooks from projects: {OCTOPUS_PROJECT_FILTER}")
 
     # Fetch prompted variables for each unique project
     project_ids = list({rb.get("ProjectId", "") for rb in runbooks if rb.get("ProjectId")})
