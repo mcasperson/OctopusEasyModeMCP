@@ -10,7 +10,6 @@ from contextlib import asynccontextmanager
 from key_value.aio.stores.azure_tables import AzureTablesStore
 from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
 
-from fastmcp.server.auth.providers.azure import AzureProvider
 from fastmcp.server.auth.providers.google import GoogleProvider
 from fastmcp.server.dependencies import get_access_token
 from pydantic import BaseModel, Field
@@ -709,4 +708,4 @@ asyncio.run(register_all_runbook_tools())
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=8000)
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=8000, allowed_hosts=["*"])
