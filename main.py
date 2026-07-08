@@ -8,6 +8,7 @@ from enum import Enum
 from contextlib import asynccontextmanager
 
 from key_value.aio.stores.azure_tables import AzureTablesStore
+from key_value.aio.stores.azure_tables.store import AzureTablesSanitizationStrategy
 
 from fastmcp.server.auth.providers.google import GoogleProvider
 from fastmcp.server.dependencies import get_access_token
@@ -33,6 +34,8 @@ OCTOPUS_SPACE_ID = os.environ["EASY_MODE_MCP_OCTOPUS_SPACE_ID"]
 storage_backend = AzureTablesStore(
     connection_string=os.environ["EASY_MODE_MCP_AZURE_STORAGE_CONNECTION_STRING"],
     table_name="mcpsessions",
+    key_sanitization_strategy=AzureTablesSanitizationStrategy(),
+    collection_sanitization_strategy=AzureTablesSanitizationStrategy(),
 )
 
 # Google OAuth configuration
