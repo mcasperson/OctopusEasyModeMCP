@@ -1,3 +1,4 @@
+# See https://github.com/PrefectHQ/fastmcp/issues/4463 for the reason for using the local dependency
 -e fastmcp/fastmcp_slim[server,tasks]
 -e fastmcp[server,tasks]
 #fastmcp[server]
