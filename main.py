@@ -11,6 +11,7 @@ from key_value.aio.stores.azure_tables import AzureTablesStore
 from key_value.aio.stores.azure_tables.store import AzureTablesSanitizationStrategy
 
 from fastmcp.server.auth.providers.google import GoogleProvider
+from auto_register_provider import AutoRegisterGoogleProvider
 from fastmcp.server.dependencies import get_access_token
 from pydantic import BaseModel, Field
 
@@ -39,7 +40,7 @@ storage_backend = AzureTablesStore(
 )
 
 # Google OAuth configuration
-auth = GoogleProvider(
+auth = AutoRegisterGoogleProvider(
     client_id=os.environ["EASY_MODE_MCP_GOOGLE_CLIENT_ID"],
     client_secret=os.environ["EASY_MODE_MCP_GOOGLE_CLIENT_SECRET"],
     base_url=base_url,
