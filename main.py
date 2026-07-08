@@ -708,4 +708,8 @@ asyncio.run(register_all_runbook_tools())
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=8000, allowed_hosts=["*"], allowed_origins=["*"])
+    transport = os.environ.get("EASY_MODE_MCP_TRANSPORT", "streamable-http")
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        mcp.run(transport="streamable-http", host="0.0.0.0", port=8000, allowed_hosts=["*"], allowed_origins=["*"])
