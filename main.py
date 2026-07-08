@@ -31,7 +31,11 @@ OCTOPUS_URL = os.environ["EASY_MODE_MCP_OCTOPUS_URL"]
 OCTOPUS_API_KEY = os.environ["EASY_MODE_MCP_OCTOPUS_API_KEY"]
 OCTOPUS_SPACE_ID = os.environ["EASY_MODE_MCP_OCTOPUS_SPACE_ID"]
 
-if AUTH_ENABLED:
+def _create_auth():
+    """Create the OAuth auth provider if authentication is enabled."""
+    if not AUTH_ENABLED:
+        return None
+
     from key_value.aio.stores.azure_tables import AzureTablesStore
     from key_value.aio.stores.azure_tables.store import AzureTablesSanitizationStrategy
 
@@ -42,8 +46,7 @@ if AUTH_ENABLED:
         collection_sanitization_strategy=AzureTablesSanitizationStrategy(),
     )
 
-    # Google OAuth configuration
-    auth = AutoRegisterGoogleProvider(
+    return AutoRegisterGoogleProvider(
         client_id=os.environ["EASY_MODE_MCP_GOOGLE_CLIENT_ID"],
         client_secret=os.environ["EASY_MODE_MCP_GOOGLE_CLIENT_SECRET"],
         base_url=base_url,
@@ -51,8 +54,9 @@ if AUTH_ENABLED:
         client_storage=storage_backend,
         jwt_signing_key=os.environ["EASY_MODE_MCP_JWT_SIGNING_KEY"],
     )
-else:
-    auth = None
+
+
+auth = _create_auth()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
