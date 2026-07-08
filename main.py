@@ -8,6 +8,9 @@ from enum import Enum
 from contextlib import asynccontextmanager
 
 from auto_register_provider import AutoRegisterGoogleProvider
+from fastmcp.server.auth.providers.github import GitHubProvider
+from fastmcp.server.auth.providers.azure import AzureProvider
+from fastmcp.server.auth.oauth_proxy import OAuthProxy
 from fastmcp.server.dependencies import get_access_token
 from pydantic import BaseModel, Field
 
@@ -16,8 +19,9 @@ from fastmcp.server.context import AcceptedElicitation
 
 base_url = os.environ.get("EASY_MODE_MCP_BASE_URL", "http://localhost:8000")
 
-# Whether to enable OAuth authentication (set to "false" to disable)
-AUTH_ENABLED = os.environ.get("EASY_MODE_MCP_AUTH_ENABLED", "true").lower() != "false"
+# Auth type: "google", "github", or "none" (default: "google")
+AUTH_TYPE = os.environ.get("EASY_MODE_MCP_AUTH_TYPE", "google").lower()
+AUTH_ENABLED = AUTH_TYPE != "none"
 
 logging.info(f"Base URL: {base_url}")
 
@@ -32,8 +36,8 @@ OCTOPUS_API_KEY = os.environ["EASY_MODE_MCP_OCTOPUS_API_KEY"]
 OCTOPUS_SPACE_ID = os.environ["EASY_MODE_MCP_OCTOPUS_SPACE_ID"]
 
 def _create_auth():
-    """Create the OAuth auth provider if authentication is enabled."""
-    if not AUTH_ENABLED:
+    """Create the OAuth auth provider based on EASY_MODE_MCP_AUTH_TYPE."""
+    if AUTH_TYPE == "none":
         return None
 
     from key_value.aio.stores.azure_tables import AzureTablesStore
@@ -46,6 +50,50 @@ def _create_auth():
         collection_sanitization_strategy=AzureTablesSanitizationStrategy(),
     )
 
+    if AUTH_TYPE == "github":
+        return GitHubProvider(
+            client_id=os.environ["EASY_MODE_MCP_GITHUB_CLIENT_ID"],
+            client_secret=os.environ["EASY_MODE_MCP_GITHUB_CLIENT_SECRET"],
+            base_url=base_url,
+            required_scopes=["read:user","user:email"],
+            client_storage=storage_backend,
+            jwt_signing_key=os.environ["EASY_MODE_MCP_JWT_SIGNING_KEY"],
+        )
+
+    if AUTH_TYPE == "azure":
+        return AzureProvider(
+            client_id=os.environ["EASY_MODE_MCP_AZURE_CLIENT_ID"],
+            client_secret=os.environ["EASY_MODE_MCP_AZURE_CLIENT_SECRET"],
+            tenant_id=os.environ["EASY_MODE_MCP_AZURE_TENANT_ID"],
+            base_url=base_url,
+            required_scopes=["openid", "email", "profile"],
+            client_storage=storage_backend,
+            jwt_signing_key=os.environ["EASY_MODE_MCP_JWT_SIGNING_KEY"],
+        )
+
+    if AUTH_TYPE == "oauth_proxy":
+        from fastmcp.server.auth.providers.jwt import JWTVerifier
+
+        token_verifier = JWTVerifier(
+            jwks_uri=os.environ["EASY_MODE_MCP_OAUTH_JWKS_URI"],
+            issuer=os.environ.get("EASY_MODE_MCP_OAUTH_ISSUER"),
+            audience=os.environ.get("EASY_MODE_MCP_OAUTH_AUDIENCE"),
+            required_scopes=os.environ.get("EASY_MODE_MCP_OAUTH_SCOPES", "").split(",") if os.environ.get("EASY_MODE_MCP_OAUTH_SCOPES") else None,
+        )
+
+        return OAuthProxy(
+            upstream_authorization_endpoint=os.environ["EASY_MODE_MCP_OAUTH_AUTHORIZATION_ENDPOINT"],
+            upstream_token_endpoint=os.environ["EASY_MODE_MCP_OAUTH_TOKEN_ENDPOINT"],
+            upstream_client_id=os.environ["EASY_MODE_MCP_OAUTH_CLIENT_ID"],
+            upstream_client_secret=os.environ.get("EASY_MODE_MCP_OAUTH_CLIENT_SECRET"),
+            upstream_revocation_endpoint=os.environ.get("EASY_MODE_MCP_OAUTH_REVOCATION_ENDPOINT"),
+            token_verifier=token_verifier,
+            base_url=base_url,
+            client_storage=storage_backend,
+            jwt_signing_key=os.environ["EASY_MODE_MCP_JWT_SIGNING_KEY"],
+        )
+
+    # Default: google
     return AutoRegisterGoogleProvider(
         client_id=os.environ["EASY_MODE_MCP_GOOGLE_CLIENT_ID"],
         client_secret=os.environ["EASY_MODE_MCP_GOOGLE_CLIENT_SECRET"],
