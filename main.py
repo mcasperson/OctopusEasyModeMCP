@@ -36,7 +36,8 @@ storage_backend = AzureTablesStore(
 encrypted_storage = FernetEncryptionWrapper(
     key_value=storage_backend,
     source_material=os.environ["EASY_MODE_MCP_JWT_SIGNING_KEY"],
-    salt="easymode-mcp-storage"
+    salt="easymode-mcp-storage",
+    raise_on_decryption_error=False,
 )
 
 # Google OAuth configuration
@@ -656,7 +657,7 @@ async def _remove_all_tools() -> None:
     tools = await mcp.list_tools()
     for tool in tools:
         try:
-            mcp.remove_tool(tool.name)
+            mcp.local_provider.remove_tool(tool.name)
         except Exception as e:
             logger.warning(f"Failed to remove tool '{tool.name}': {e}")
 

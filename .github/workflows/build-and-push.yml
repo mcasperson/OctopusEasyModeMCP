@@ -48,3 +48,24 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to Azure Container App
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          resourceGroup: ${{ vars.AZURE_RESOURCE_GROUP }}
+          containerAppName: ${{ vars.AZURE_CONTAINER_APP_NAME }}
+          imageToDeploy: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          registryUrl: ${{ env.REGISTRY }}
+          registryUsername: ${{ github.actor }}
+          registryPassword: ${{ secrets.GITHUB_TOKEN }}
+
