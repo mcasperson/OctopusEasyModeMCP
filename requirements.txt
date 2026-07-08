@@ -1,5 +1,5 @@
--e /Users/matthewcasperson/Code/fastmcp/fastmcp_slim[server,tasks]
--e /Users/matthewcasperson/Code/fastmcp[server,tasks]
+-e fastmcp/fastmcp_slim[server,tasks]
+-e fastmcp[server,tasks]
 #fastmcp[server]
 #fastmcp[tasks]
 pydocket>=0.19.0
