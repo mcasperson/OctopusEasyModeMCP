@@ -18,6 +18,22 @@ AUTH_TYPE = os.environ.get("EASY_MODE_MCP_AUTH_TYPE", "google").lower()
 AUTH_ENABLED = AUTH_TYPE != "none"
 
 
+def _raise_for_status(resp: httpx.Response) -> None:
+    """Raise for HTTP errors, logging the response body for debugging."""
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            "HTTP %s for %s: %s",
+            resp.status_code, resp.request.url, resp.text,
+        )
+        raise httpx.HTTPStatusError(
+            message=f"HTTP {resp.status_code} for {resp.request.url}: {resp.text}",
+            request=resp.request,
+            response=resp,
+        ) from e
+
+
 def octopus_headers(bearer_token: str | None = None) -> dict[str, str]:
     """Build Octopus API headers with either a bearer token or API key."""
     if bearer_token:
@@ -108,6 +124,8 @@ async def _get_all_cac_runbooks(client: httpx.AsyncClient) -> list[dict]:
             while True:
                 data = await _fetch_cac_runbooks_page(client, project_id, git_ref, skip, take)
                 items = data.get("Items", [])
+                for item in items:
+                    item["_git_ref"] = git_ref
                 runbooks.extend(items)
                 if skip + take >= data.get("TotalResults", 0):
                     break
@@ -147,7 +165,7 @@ async def _fetch_cac_runbooks_page(client: httpx.AsyncClient, project_id: str, g
         f"/api/{OCTOPUS_SPACE_ID}/projects/{project_id}/{git_ref}/runbooks",
         params={"skip": skip, "take": take},
     )
-    resp.raise_for_status()
+    _raise_for_status(resp)
     return resp.json()
 
 
@@ -157,7 +175,7 @@ async def _fetch_database_runbooks_page(client: httpx.AsyncClient, skip: int, ta
         f"/api/{OCTOPUS_SPACE_ID}/runbooks",
         params={"skip": skip, "take": take},
     )
-    resp.raise_for_status()
+    _raise_for_status(resp)
     return resp.json()
 
 
@@ -171,7 +189,7 @@ async def _get_all_projects(client: httpx.AsyncClient) -> list[dict]:
             f"/api/{OCTOPUS_SPACE_ID}/projects",
             params={"skip": skip, "take": take},
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
         data = resp.json()
         items = data.get("Items", [])
         projects.extend(items)
@@ -181,12 +199,22 @@ async def _get_all_projects(client: httpx.AsyncClient) -> list[dict]:
     return projects
 
 
-async def get_project_prompted_variables(project_id: str) -> list[dict]:
-    """Fetch prompted variables for a project."""
+async def get_project_prompted_variables(project_id: str, git_ref: str | None = None) -> list[dict]:
+    """Fetch prompted variables for a project.
+
+    For CaC projects, uses the git ref endpoint. For database-backed projects,
+    uses the variable set endpoint.
+    """
     async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=octopus_headers()) as client:
-        variable_set_id = f"variableset-{project_id}"
-        resp = await client.get(f"/api/{OCTOPUS_SPACE_ID}/variables/{variable_set_id}")
-        resp.raise_for_status()
+        if git_ref:
+            # CaC projects store variables in git
+            encoded_ref = f"refs/heads/{git_ref}".replace("/", "%2F")
+            resp = await client.get(f"/api/{OCTOPUS_SPACE_ID}/projects/{project_id}/{encoded_ref}/variables")
+        else:
+            # Database-backed projects use the variable set endpoint
+            variable_set_id = f"variableset-{project_id}"
+            resp = await client.get(f"/api/{OCTOPUS_SPACE_ID}/variables/{variable_set_id}")
+        _raise_for_status(resp)
         data = resp.json()
         prompted = []
         for var in data.get("Variables", []):
@@ -216,7 +244,7 @@ async def get_runbook_preview_form(client: httpx.AsyncClient, snapshot_id: str, 
     resp = await client.get(
         f"/api/{OCTOPUS_SPACE_ID}/runbookSnapshots/{snapshot_id}/runbookRuns/preview/{environment_id}"
     )
-    resp.raise_for_status()
+    _raise_for_status(resp)
     preview = resp.json()
     form = preview.get("Form", {})
     elements = form.get("Elements", [])
@@ -224,13 +252,13 @@ async def get_runbook_preview_form(client: httpx.AsyncClient, snapshot_id: str, 
     return elements, form_values
 
 
-async def create_runbook_run(client: httpx.AsyncClient, runbook_id: str, snapshot_id: str, environment_id: str, form_values: dict[str, str], tenant_id: str | None = None) -> str:
+async def create_runbook_run(client: httpx.AsyncClient, runbook_id: str, snapshot_id: str | None, environment_id: str, form_values: dict[str, str], tenant_id: str | None = None) -> str:
     """Create a runbook run and return the task ID.
 
     Args:
         client: The HTTP client to use
         runbook_id: The runbook to run
-        snapshot_id: The published runbook snapshot ID
+        snapshot_id: The published runbook snapshot ID (None for config-as-code runbooks)
         environment_id: The environment to run in
         form_values: Form values to submit with the run
         tenant_id: Optional tenant ID for tenanted runs
@@ -240,9 +268,10 @@ async def create_runbook_run(client: httpx.AsyncClient, runbook_id: str, snapsho
     """
     payload = {
         "RunbookId": runbook_id,
-        "RunbookSnapshotId": snapshot_id,
         "EnvironmentId": environment_id,
     }
+    if snapshot_id:
+        payload["RunbookSnapshotId"] = snapshot_id
     if form_values:
         payload["FormValues"] = form_values
     if tenant_id:
@@ -252,22 +281,84 @@ async def create_runbook_run(client: httpx.AsyncClient, runbook_id: str, snapsho
         f"/api/{OCTOPUS_SPACE_ID}/runbookRuns",
         json=payload,
     )
-    resp.raise_for_status()
+    _raise_for_status(resp)
     run = resp.json()
     return run["TaskId"]
+
+
+async def create_cac_runbook_run(client: httpx.AsyncClient, project_id: str, git_ref: str, runbook_slug: str, environment_id: str, form_values: dict[str, str] | None = None, tenant_id: str | None = None) -> str:
+    """Create a config-as-code runbook run and return the task ID.
+
+    Args:
+        client: The HTTP client to use
+        project_id: The project containing the runbook
+        git_ref: The git branch name (e.g., "main")
+        runbook_slug: The runbook slug (e.g., "get-current-time")
+        environment_id: The environment to run in
+        form_values: Optional form values to submit with the run
+        tenant_id: Optional tenant ID for tenanted runs
+
+    Returns:
+        The server task ID for the created run.
+    """
+    encoded_ref = f"refs/heads/{git_ref}".replace("/", "%2F")
+
+    run_entry: dict = {
+        "EnvironmentId": environment_id,
+        "TenantId": tenant_id,
+        "ForcePackageDownload": False,
+        "DebugMode": "None",
+        "SkipActions": [],
+        "SpecificMachineIds": [],
+        "ExcludedMachineIds": [],
+        "SpecificTargetTagIds": [],
+        "ExcludedTargetTagIds": [],
+        "UseGuidedFailure": False,
+        "FormValues": form_values or {},
+        "QueueTime": None,
+        "QueueTimeExpiry": None,
+    }
+
+    payload = {
+        "SelectedPackages": [],
+        "SelectedGitResources": [],
+        "Runs": [run_entry],
+    }
+
+    resp = await client.post(
+        f"/api/{OCTOPUS_SPACE_ID}/projects/{project_id}/{encoded_ref}/runbooks/{runbook_slug}/run/v1",
+        json=payload,
+    )
+    logger.info(f"CaC runbook run request payload: {payload}")
+    logger.info(f"CaC runbook run response: {resp.status_code} {resp.text}")
+    _raise_for_status(resp)
+    data = resp.json()
+
+    # The response is a dict with a "Resources" list of runbook run objects
+    if isinstance(data, dict):
+        resources = data.get("Resources", [])
+        if resources:
+            return resources[0].get("TaskId", "")
+        return data.get("TaskId", "")
+
+    # Fallback: response is a list directly
+    if isinstance(data, list) and data:
+        return data[0].get("TaskId", "")
+
+    return ""
 
 
 async def get_task_raw_log(client: httpx.AsyncClient, task_id: str) -> str:
     """Download the raw log for a server task."""
     log_resp = await client.get(f"/api/tasks/{task_id}/raw")
-    log_resp.raise_for_status()
+    _raise_for_status(log_resp)
     return log_resp.text
 
 
 async def get_task_status(client: httpx.AsyncClient, task_id: str) -> dict:
     """Fetch a server task and return its JSON representation."""
     resp = await client.get(f"/api/tasks/{task_id}")
-    resp.raise_for_status()
+    _raise_for_status(resp)
     return resp.json()
 
 
@@ -277,7 +368,7 @@ async def get_pending_interruptions(client: httpx.AsyncClient, task_id: str) -> 
         f"/api/{OCTOPUS_SPACE_ID}/interruptions",
         params={"regarding": task_id, "pendingOnly": "true"},
     )
-    resp.raise_for_status()
+    _raise_for_status(resp)
     return resp.json().get("Items", [])
 
 
@@ -289,7 +380,7 @@ async def submit_interruption(client: httpx.AsyncClient, interruption_id: str, p
     )
     if resp.status_code != 200:
         logger.error(f"Intervention submit failed: {resp.status_code} {resp.text}")
-    resp.raise_for_status()
+    _raise_for_status(resp)
 
 
 async def take_interruption_responsibility(client: httpx.AsyncClient, interruption_id: str) -> None:
@@ -299,7 +390,7 @@ async def take_interruption_responsibility(client: httpx.AsyncClient, interrupti
     )
     if resp.status_code != 200:
         logger.error(f"Taking responsibility failed: {resp.status_code} {resp.text}")
-    resp.raise_for_status()
+    _raise_for_status(resp)
     logger.info(f"Took responsibility for interruption '{interruption_id}'")
 
 
@@ -309,14 +400,14 @@ async def search_tenants(client: httpx.AsyncClient, tenant_name: str) -> list[di
         f"/api/{OCTOPUS_SPACE_ID}/tenants",
         params={"partialName": tenant_name, "take": 100},
     )
-    resp.raise_for_status()
+    _raise_for_status(resp)
     return resp.json().get("Items", [])
 
 
 async def get_tenant_detail(client: httpx.AsyncClient, tenant_id: str) -> dict:
     """Fetch full tenant details by ID."""
     resp = await client.get(f"/api/{OCTOPUS_SPACE_ID}/tenants/{tenant_id}")
-    resp.raise_for_status()
+    _raise_for_status(resp)
     return resp.json()
 
 
@@ -358,7 +449,7 @@ async def resolve_tenant(client: httpx.AsyncClient, tenant_name: str, project_id
 async def get_published_snapshot_id(client: httpx.AsyncClient, runbook_id: str) -> str | None:
     """Fetch a runbook and return its published snapshot ID."""
     resp = await client.get(f"/api/{OCTOPUS_SPACE_ID}/runbooks/{runbook_id}")
-    resp.raise_for_status()
+    _raise_for_status(resp)
     runbook = resp.json()
     return runbook.get("PublishedRunbookSnapshotId")
 
@@ -370,7 +461,7 @@ async def get_environments() -> list[dict]:
             f"/api/{OCTOPUS_SPACE_ID}/environments",
             params={"take": 1000},
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json().get("Items", [])
 
 
@@ -381,7 +472,7 @@ async def get_runbook_environments(runbook: dict) -> list[dict]:
         return []
     async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=octopus_headers()) as client:
         resp = await client.get(environments_link)
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()
 
 
@@ -394,7 +485,7 @@ async def get_project_ids_by_names(project_names: list[str]) -> set[str]:
                 f"/api/{OCTOPUS_SPACE_ID}/projects",
                 params={"partialName": name, "take": 100},
             )
-            resp.raise_for_status()
+            _raise_for_status(resp)
             for project in resp.json().get("Items", []):
                 if project["Name"].lower() == name.lower():
                     project_ids.add(project["Id"])

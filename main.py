@@ -22,6 +22,7 @@ from octopus import (
     get_all_runbooks,
     get_project_prompted_variables,
     create_runbook_run,
+    create_cac_runbook_run,
     get_task_raw_log,
     get_task_status,
     get_pending_interruptions,
@@ -254,20 +255,33 @@ async def _poll_task_to_completion(client: httpx.AsyncClient, task_id: str, ctx:
         await asyncio.sleep(5)
 
 
-async def _run_runbook(runbook_id: str, environment_id: str, variable_values: dict[str, str] | None = None, ctx: Context | None = None, tenant_id: str | None = None, project_id: str | None = None) -> dict:
+async def _run_runbook(runbook_id: str, environment_id: str, variable_values: dict[str, str] | None = None, ctx: Context | None = None, tenant_id: str | None = None, project_id: str | None = None, is_cac: bool = False, git_ref: str | None = None, runbook_slug: str | None = None) -> dict:
     """Trigger a runbook run and poll for completion, returning the final task status."""
     headers = await get_authenticated_headers()
 
     async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=headers) as client:
-        snapshot_id = await get_published_snapshot_id(client, runbook_id)
-        if not snapshot_id:
-            return {"status": "Failed", "error": "Runbook has no published snapshot"}
+        if is_cac:
+            # Config-as-code runbooks use a different run endpoint
+            form_values = {}
+            if variable_values:
+                # For CaC runbooks, map variable names directly as form values
+                form_values = dict(variable_values)
+            task_id = await create_cac_runbook_run(
+                client, project_id, git_ref, runbook_slug,
+                environment_id, form_values=form_values, tenant_id=tenant_id,
+            )
+        else:
+            # Database-backed runbooks use published snapshots
+            snapshot_id = await get_published_snapshot_id(client, runbook_id)
+            if not snapshot_id:
+                return {"status": "Failed", "error": "Runbook has no published snapshot"}
 
-        form_values = {}
-        if variable_values:
-            form_values = await build_form_values(client, snapshot_id, environment_id, variable_values)
+            form_values = {}
+            if variable_values:
+                form_values = await build_form_values(client, snapshot_id, environment_id, variable_values)
 
-        task_id = await create_runbook_run(client, runbook_id, snapshot_id, environment_id, form_values, tenant_id=tenant_id)
+            task_id = await create_runbook_run(client, runbook_id, snapshot_id, environment_id, form_values, tenant_id=tenant_id)
+
         return await _poll_task_to_completion(client, task_id, ctx)
 
 
@@ -357,26 +371,42 @@ async def _resolve_environment(environment_name: str, environments: list[dict]) 
     return env_id, None
 
 
-async def _collect_variable_values(kwargs: dict, param_to_var: dict, ctx: Context | None) -> tuple[dict[str, str], dict | None]:
-    """Collect variable values from kwargs, eliciting missing required values."""
+async def _collect_variable_values(kwargs: dict, param_to_var: dict, ctx: Context | None, use_var_id: bool = False) -> tuple[dict[str, str], dict | None]:
+    """Collect variable values from kwargs, eliciting missing required values.
+
+    Args:
+        kwargs: The keyword arguments from the tool call.
+        param_to_var: Mapping of parameter names to variable info dicts.
+        ctx: The MCP context for elicitation.
+        use_var_id: If True, use the variable ID as the form value key (for CaC runbooks).
+    """
     variable_values = {}
     for param_name, var in param_to_var.items():
+        key = var["id"] if use_var_id else var["name"]
         value = kwargs.get(param_name)
         if value is not None:
-            variable_values[var["name"]] = value
-        elif var["required"] and not var["default"] and ctx:
+            variable_values[key] = value
+        elif var["default"]:
+            # Include default values (especially important for CaC runbooks)
+            variable_values[key] = var["default"]
+        elif var["required"] and ctx:
             var_desc = var["description"] or var["label"]
             elicit_result = await ctx.elicit(
                 message=f"Please provide a value for **{var['label']}**\n\n{var_desc}",
                 response_type=str,
             )
             if isinstance(elicit_result, AcceptedElicitation):
-                variable_values[var["name"]] = elicit_result.data
+                variable_values[key] = elicit_result.data
             else:
                 return {}, {
                     "status": "Failed",
                     "error": f"Required variable '{var['label']}' was not provided and user declined to supply a value.",
                 }
+        elif var["required"] and not ctx:
+            return {}, {
+                "status": "Failed",
+                "error": f"Required variable '{var['label']}' was not provided.",
+            }
     return variable_values, None
 
 
@@ -407,6 +437,9 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
     tool_name = _sanitize_tool_name(runbook_name)
     multi_tenancy_mode = runbook.get("MultiTenancyMode", "Untenanted")
     is_tenanted = multi_tenancy_mode in ("Tenanted", "TenantedOrUntenanted")
+    is_cac = not runbook.get("PublishedRunbookSnapshotId")
+    git_ref = runbook.get("_git_ref", "")
+    runbook_slug = runbook.get("Slug", "")
 
     logger.info(
         f"Registering runbook tool: {tool_name} (runbook_id={runbook_id}, project_id={project_id}, "
@@ -446,7 +479,7 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
         if env_error:
             return {"status": "Failed", "error": env_error}
 
-        variable_values, var_error = await _collect_variable_values(kwargs, param_to_var, ctx)
+        variable_values, var_error = await _collect_variable_values(kwargs, param_to_var, ctx, use_var_id=is_cac)
         if var_error:
             return var_error
 
@@ -454,7 +487,7 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
         if tenant_error:
             return tenant_error
 
-        return await _run_runbook(runbook_id, env_id, variable_values if variable_values else None, ctx=ctx, tenant_id=resolved_tenant_id, project_id=project_id)
+        return await _run_runbook(runbook_id, env_id, variable_values if variable_values else None, ctx=ctx, tenant_id=resolved_tenant_id, project_id=project_id, is_cac=is_cac, git_ref=git_ref, runbook_slug=runbook_slug)
 
     run_tool.__doc__ = _build_tool_docstring(description, project_id, env_help, single_env, is_tenanted, multi_tenancy_mode, param_to_var)
     run_tool.__name__ = tool_name
@@ -490,9 +523,16 @@ async def register_all_runbook_tools() -> None:
         logger.info(f"Filtered to {len(runbooks)} runbooks from projects: {OCTOPUS_PROJECT_FILTER}")
 
     # Fetch prompted variables for each unique project
-    project_ids = list({rb.get("ProjectId", "") for rb in runbooks if rb.get("ProjectId")})
+    # Build a mapping of project_id -> git_ref (for CaC projects)
+    project_git_refs: dict[str, str | None] = {}
+    for rb in runbooks:
+        pid = rb.get("ProjectId", "")
+        if pid and pid not in project_git_refs:
+            project_git_refs[pid] = rb.get("_git_ref")
+
+    project_ids = list(project_git_refs.keys())
     project_vars = await asyncio.gather(
-        *[get_project_prompted_variables(pid) for pid in project_ids]
+        *[get_project_prompted_variables(pid, git_ref=project_git_refs.get(pid)) for pid in project_ids]
     )
     project_prompted_vars = dict(zip(project_ids, project_vars))
 
