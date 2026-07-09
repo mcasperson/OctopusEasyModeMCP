@@ -33,7 +33,6 @@ from octopus import (
     get_published_snapshot_id,
     get_environments,
     get_runbook_environments,
-    get_project_ids_by_names,
     build_form_values,
     build_task_result,
     octopus_headers,

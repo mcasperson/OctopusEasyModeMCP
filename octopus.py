@@ -466,30 +466,41 @@ async def get_environments() -> list[dict]:
 
 
 async def get_runbook_environments(runbook: dict) -> list[dict]:
-    """Fetch environments available for a runbook via its RunbookEnvironments link."""
-    environments_link = runbook.get("Links", {}).get("RunbookEnvironments")
-    if not environments_link:
+    """Fetch environments available for a runbook via the environments/v2 endpoint.
+
+    Uses the project-scoped endpoint:
+    /api/{spaceId}/projects/{projectId}/{encodedGitRef}/runbooks/{slug}/environments/v2
+    for config-as-code runbooks, or the standard runbook environments endpoint for
+    database-backed runbooks.
+
+    The v2 endpoint returns environment IDs, so this function resolves them
+    to full environment objects.
+    """
+    project_id = runbook.get("ProjectId", "")
+    git_ref = runbook.get("_git_ref", "")
+    slug = runbook.get("Slug", "")
+
+    if not project_id or not slug:
         return []
-    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=octopus_headers()) as client:
-        resp = await client.get(environments_link)
-        _raise_for_status(resp)
-        return resp.json()
 
-
-async def get_project_ids_by_names(project_names: list[str]) -> set[str]:
-    """Fetch project IDs for the given project names."""
-    project_ids = set()
     async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=octopus_headers()) as client:
-        for name in project_names:
+        if git_ref:
+            # Config-as-code runbook
+            encoded_ref = f"refs/heads/{git_ref}".replace("/", "%2F")
             resp = await client.get(
-                f"/api/{OCTOPUS_SPACE_ID}/projects",
-                params={"partialName": name, "take": 100},
+                f"/api/{OCTOPUS_SPACE_ID}/projects/{project_id}/{encoded_ref}/runbooks/{slug}/environments/v2"
             )
-            _raise_for_status(resp)
-            for project in resp.json().get("Items", []):
-                if project["Name"].lower() == name.lower():
-                    project_ids.add(project["Id"])
-    return project_ids
+        else:
+            # Database-backed runbook
+            runbook_id = runbook.get("Id", "")
+            if not runbook_id:
+                return []
+            resp = await client.get(
+                f"/api/{OCTOPUS_SPACE_ID}/projects/{project_id}/runbooks/{runbook_id}/environments/v2"
+            )
+        _raise_for_status(resp)
+        data = resp.json()
+        return data.get("Environments", [])
 
 
 def parse_interruption_form(interruption: dict) -> tuple[str, str | None, str | None]:
