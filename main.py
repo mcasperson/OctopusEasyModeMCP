@@ -262,7 +262,7 @@ async def _get_runbook_preview_form(client: httpx.AsyncClient, snapshot_id: str,
     return elements, form_values
 
 
-async def _create_runbook_run(client: httpx.AsyncClient, runbook_id: str, snapshot_id: str, environment_id: str, form_values: dict[str, str]) -> str:
+async def _create_runbook_run(client: httpx.AsyncClient, runbook_id: str, snapshot_id: str, environment_id: str, form_values: dict[str, str], tenant_id: str | None = None) -> str:
     """Create a runbook run and return the task ID.
 
     Args:
@@ -271,6 +271,7 @@ async def _create_runbook_run(client: httpx.AsyncClient, runbook_id: str, snapsh
         snapshot_id: The published runbook snapshot ID
         environment_id: The environment to run in
         form_values: Form values to submit with the run
+        tenant_id: Optional tenant ID for tenanted runs
 
     Returns:
         The server task ID for the created run.
@@ -282,6 +283,8 @@ async def _create_runbook_run(client: httpx.AsyncClient, runbook_id: str, snapsh
     }
     if form_values:
         payload["FormValues"] = form_values
+    if tenant_id:
+        payload["TenantId"] = tenant_id
 
     resp = await client.post(
         f"/api/{OCTOPUS_SPACE_ID}/runbookRuns",
@@ -399,6 +402,48 @@ def _parse_interruption_form(interruption: dict) -> tuple[str, str | None, str |
     return instructions, notes_element_id, result_element_id
 
 
+async def _resolve_tenant(client: httpx.AsyncClient, tenant_name: str, project_id: str, environment_id: str) -> tuple[str | None, str | None]:
+    """Resolve a tenant name to an ID and validate it's linked to the project and environment.
+
+    Returns:_resolve_tenant
+        A tuple of (tenant_id, error_message). If successful, error_message is None.
+    """
+    resp = await client.get(
+        f"/api/{OCTOPUS_SPACE_ID}/tenants",
+        params={"partialName": tenant_name, "take": 100},
+    )
+    resp.raise_for_status()
+    tenants = resp.json().get("Items", [])
+
+    # Find exact match
+    tenant = None
+    for t in tenants:
+        if t["Name"].lower() == tenant_name.lower():
+            tenant = t
+            break
+
+    if tenant is None:
+        available = [t["Name"] for t in tenants[:10]]
+        return None, f"Tenant '{tenant_name}' not found. Partial matches: {available}"
+
+    tenant_id = tenant["Id"]
+
+    # Fetch full tenant details to check project/environment linkage
+    detail_resp = await client.get(f"/api/{OCTOPUS_SPACE_ID}/tenants/{tenant_id}")
+    detail_resp.raise_for_status()
+    tenant_detail = detail_resp.json()
+
+    project_envs = tenant_detail.get("ProjectEnvironments", {})
+    if project_id not in project_envs:
+        return None, f"Tenant '{tenant_name}' is not linked to project '{project_id}'."
+
+    linked_envs = project_envs[project_id]
+    if environment_id not in linked_envs:
+        return None, f"Tenant '{tenant_name}' is not linked to environment '{environment_id}' for this project."
+
+    return tenant_id, None
+
+
 async def _get_published_snapshot_id(client: httpx.AsyncClient, runbook_id: str) -> str | None:
     """Fetch a runbook and return its published snapshot ID.
 
@@ -415,7 +460,7 @@ async def _get_published_snapshot_id(client: httpx.AsyncClient, runbook_id: str)
     return runbook.get("PublishedRunbookSnapshotId")
 
 
-async def _run_runbook(runbook_id: str, environment_id: str, variable_values: dict[str, str] | None = None, ctx: Context | None = None) -> dict:
+async def _run_runbook(runbook_id: str, environment_id: str, variable_values: dict[str, str] | None = None, ctx: Context | None = None, tenant_id: str | None = None, project_id: str | None = None) -> dict:
     """Trigger a runbook run and poll for completion, returning the final task status.
 
     Args:
@@ -423,6 +468,8 @@ async def _run_runbook(runbook_id: str, environment_id: str, variable_values: di
         environment_id: The environment to run in
         variable_values: Dict mapping variable names to their values for prompted variables
         ctx: MCP context for elicitation during manual interventions
+        tenant_id: Optional tenant ID for tenanted runs
+        project_id: Optional project ID for tenant validation
     """
     if AUTH_ENABLED:
         # Exchange the user's Google ID token for an Octopus access token
@@ -474,7 +521,7 @@ async def _run_runbook(runbook_id: str, environment_id: str, variable_values: di
                 )
 
         # Create the runbook run
-        task_id = await _create_runbook_run(client, runbook_id, snapshot_id, environment_id, form_values)
+        task_id = await _create_runbook_run(client, runbook_id, snapshot_id, environment_id, form_values, tenant_id=tenant_id)
 
         # Poll the server task until completion
         while True:
@@ -580,6 +627,8 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
     project_id = runbook.get("ProjectId", "")
     description = runbook.get("Description") or f"Run the '{runbook_name}' runbook"
     tool_name = _sanitize_tool_name(runbook_name)
+    multi_tenancy_mode = runbook.get("MultiTenancyMode", "Untenanted")
+    is_tenanted = multi_tenancy_mode in ("Tenanted", "TenantedOrUntenanted")
 
     logger.info(
         f"Registering runbook tool: {tool_name} (runbook_id={runbook_id}, project_id={project_id}, "
@@ -625,6 +674,18 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
                 inspect.Parameter.POSITIONAL_OR_KEYWORD,
                 default=default,
                 annotation=str | None if not var["required"] else str,
+            )
+        )
+
+    # Add tenant_name parameter for tenanted runbooks
+    if is_tenanted:
+        tenant_required = multi_tenancy_mode == "Tenanted"
+        params.append(
+            inspect.Parameter(
+                "tenant_name",
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                default=inspect.Parameter.empty if tenant_required else None,
+                annotation=str if tenant_required else str | None,
             )
         )
 
@@ -674,13 +735,34 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
                         "error": f"Required variable '{var['label']}' was not provided and user declined to supply a value.",
                     }
 
-        return await _run_runbook(runbook_id, env_id, variable_values if variable_values else None, ctx=ctx)
+        # Resolve tenant name to ID if provided
+        resolved_tenant_id = None
+        if is_tenanted:
+            tenant_name_val = kwargs.get("tenant_name")
+            if tenant_name_val:
+                if AUTH_ENABLED:
+                    google_access_token = get_access_token()
+                    access_token = await exchange_token_for_octopus_token(google_access_token.id_token)
+                    tenant_headers = _octopus_headers(access_token)
+                else:
+                    tenant_headers = _octopus_headers()
+                async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=tenant_headers) as tenant_client:
+                    resolved_tenant_id, error = await (tenant_client, tenant_name_val, project_id, env_id)
+                    if error:
+                        return {"status": "Failed", "error": error}
+            elif multi_tenancy_mode == "Tenanted":
+                return {"status": "Failed", "error": "Tenant name is required for this runbook."}
+
+        return await _run_runbook(runbook_id, env_id, variable_values if variable_values else None, ctx=ctx, tenant_id=resolved_tenant_id, project_id=project_id)
 
     # Build docstring with prompted variable info
     if single_env:
         args_doc = ""
     else:
         args_doc = "    environment_name: The name of the environment to run the runbook in\n"
+    if is_tenanted:
+        tenant_req_str = " (required)" if multi_tenancy_mode == "Tenanted" else " (optional)"
+        args_doc += f"    tenant_name: The name of the tenant to run the runbook for{tenant_req_str}\n"
     for param_name, var in param_to_var.items():
         required_str = " (required)" if var["required"] else " (optional)"
         var_desc = var["description"] or var["label"]
@@ -703,6 +785,8 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
     annotations = {"return": dict, "ctx": Context}
     if not single_env:
         annotations["environment_name"] = EnvironmentEnum
+    if is_tenanted:
+        annotations["tenant_name"] = str if multi_tenancy_mode == "Tenanted" else str | None
     for param_name, var in param_to_var.items():
         annotations[param_name] = str | None if not var["required"] else str
     run_tool.__annotations__ = annotations
