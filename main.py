@@ -483,9 +483,6 @@ async def register_all_runbook_tools() -> None:
         get_environments(),
     )
 
-    # Only include runbooks that have a published snapshot
-    runbooks = [rb for rb in runbooks if rb.get("PublishedRunbookSnapshotId")]
-
     # Filter by project names if configured
     if OCTOPUS_PROJECT_FILTER:
         allowed_project_ids = await get_project_ids_by_names(OCTOPUS_PROJECT_FILTER)
