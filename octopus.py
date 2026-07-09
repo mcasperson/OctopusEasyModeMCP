@@ -71,24 +71,114 @@ async def get_authenticated_headers() -> dict[str, str]:
 
 
 async def get_all_runbooks() -> list[dict]:
-    """Fetch all runbooks from the Octopus space."""
+    """Fetch all runbooks from the Octopus space (database-backed and config-as-code)."""
+    runbooks = []
+    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=octopus_headers()) as client:
+        # Fetch database-backed runbooks (only published ones)
+        runbooks.extend(await _get_all_database_runbooks(client))
+
+        # Fetch config-as-code runbooks from version-controlled projects
+        runbooks.extend(await _get_all_cac_runbooks(client))
+
+    return runbooks
+
+
+async def _get_all_cac_runbooks(client: httpx.AsyncClient) -> list[dict]:
+    """Fetch all config-as-code runbooks from version-controlled projects."""
+    runbooks = []
+    try:
+        projects = await _get_all_projects(client)
+    except Exception:
+        logger.exception("Failed to fetch projects for config-as-code runbooks")
+        return runbooks
+
+    for project in projects:
+        if not project.get("IsVersionControlled"):
+            continue
+        persistence = project.get("PersistenceSettings", {})
+        if persistence.get("Type") != "VersionControlled":
+            continue
+        git_ref: str = persistence.get("DefaultBranch", "")
+        if not git_ref:
+            continue
+        project_id = project["Id"]
+        skip = 0
+        take = 30
+        try:
+            while True:
+                data = await _fetch_cac_runbooks_page(client, project_id, git_ref, skip, take)
+                items = data.get("Items", [])
+                runbooks.extend(items)
+                if skip + take >= data.get("TotalResults", 0):
+                    break
+                skip += take
+        except Exception:
+            logger.exception(
+                "Failed to fetch config-as-code runbooks for project %s (skip=%d)",
+                project_id, skip,
+            )
+
+    return runbooks
+
+
+async def _get_all_database_runbooks(client: httpx.AsyncClient) -> list[dict]:
+    """Fetch all published database-backed runbooks."""
     runbooks = []
     skip = 0
     take = 30
-    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=octopus_headers()) as client:
+    try:
         while True:
-            resp = await client.get(
-                f"/api/{OCTOPUS_SPACE_ID}/runbooks",
-                params={"skip": skip, "take": take},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            data = await _fetch_database_runbooks_page(client, skip, take)
             items = data.get("Items", [])
-            runbooks.extend(items)
+            for item in items:
+                if item.get("PublishedRunbookSnapshotId"):
+                    runbooks.append(item)
             if skip + take >= data.get("TotalResults", 0):
                 break
             skip += take
+    except Exception:
+        logger.exception("Failed to fetch database-backed runbooks (skip=%d)", skip)
     return runbooks
+
+
+async def _fetch_cac_runbooks_page(client: httpx.AsyncClient, project_id: str, git_ref: str, skip: int, take: int) -> dict:
+    """Fetch a single page of config-as-code runbooks for a project."""
+    resp = await client.get(
+        f"/api/{OCTOPUS_SPACE_ID}/projects/{project_id}/{git_ref}/runbooks",
+        params={"skip": skip, "take": take},
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _fetch_database_runbooks_page(client: httpx.AsyncClient, skip: int, take: int) -> dict:
+    """Fetch a single page of database-backed runbooks."""
+    resp = await client.get(
+        f"/api/{OCTOPUS_SPACE_ID}/runbooks",
+        params={"skip": skip, "take": take},
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _get_all_projects(client: httpx.AsyncClient) -> list[dict]:
+    """Fetch all projects from the Octopus space."""
+    projects = []
+    skip = 0
+    take = 30
+    while True:
+        resp = await client.get(
+            f"/api/{OCTOPUS_SPACE_ID}/projects",
+            params={"skip": skip, "take": take},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("Items", [])
+        projects.extend(items)
+        if skip + take >= data.get("TotalResults", 0):
+            break
+        skip += take
+    return projects
 
 
 async def get_project_prompted_variables(project_id: str) -> list[dict]:
