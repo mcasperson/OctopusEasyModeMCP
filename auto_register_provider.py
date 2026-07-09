@@ -31,6 +31,11 @@ class AutoRegisterGoogleProvider(GoogleProvider):
         # Try the normal lookup first (storage, CIMD, upstream match)
         client = await super().get_client(client_id)
         if client is not None:
+            # Ensure allow_unregistered_redirect_uris is set, since it's
+            # excluded from serialization (exclude=True) and reverts to False
+            # when loaded from storage.
+            if isinstance(client, ProxyDCRClient):
+                client.allow_unregistered_redirect_uris = True
             return client
 
         # Auto-register the unknown client
