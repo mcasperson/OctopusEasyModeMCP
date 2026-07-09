@@ -747,7 +747,7 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
                 else:
                     tenant_headers = _octopus_headers()
                 async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=tenant_headers) as tenant_client:
-                    resolved_tenant_id, error = await (tenant_client, tenant_name_val, project_id, env_id)
+                    resolved_tenant_id, error = await _resolve_tenant(tenant_client, tenant_name_val, project_id, env_id)
                     if error:
                         return {"status": "Failed", "error": error}
             elif multi_tenancy_mode == "Tenanted":
