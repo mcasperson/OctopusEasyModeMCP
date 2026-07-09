@@ -503,6 +503,22 @@ async def get_runbook_environments(runbook: dict) -> list[dict]:
         return data.get("Environments", [])
 
 
+async def get_project_ids_by_names(project_names: list[str]) -> set[str]:
+    """Fetch project IDs for the given project names."""
+    project_ids = set()
+    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=octopus_headers()) as client:
+        for name in project_names:
+            resp = await client.get(
+                f"/api/{OCTOPUS_SPACE_ID}/projects",
+                params={"partialName": name, "take": 100},
+            )
+            _raise_for_status(resp)
+            for project in resp.json().get("Items", []):
+                if project["Name"].lower() == name.lower():
+                    project_ids.add(project["Id"])
+    return project_ids
+
+
 def parse_interruption_form(interruption: dict) -> tuple[str, str | None, str | None]:
     """Parse an interruption's form to extract instructions and element IDs.
 
