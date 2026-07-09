@@ -11,15 +11,36 @@ from auto_register_provider import AutoRegisterGoogleProvider
 from fastmcp.server.auth.providers.github import GitHubProvider
 from fastmcp.server.auth.providers.azure import AzureProvider
 from fastmcp.server.auth.oauth_proxy import OAuthProxy
-from fastmcp.server.dependencies import get_access_token
 from pydantic import BaseModel, Field
 
 from fastmcp import FastMCP, Context
 from fastmcp.server.context import AcceptedElicitation
 
+from octopus import (
+    OCTOPUS_URL,
+    get_authenticated_headers,
+    get_all_runbooks,
+    get_project_prompted_variables,
+    create_runbook_run,
+    get_task_raw_log,
+    get_task_status,
+    get_pending_interruptions,
+    submit_interruption,
+    take_interruption_responsibility,
+    parse_interruption_form,
+    resolve_tenant,
+    get_published_snapshot_id,
+    get_environments,
+    get_runbook_environments,
+    get_project_ids_by_names,
+    build_form_values,
+    build_task_result,
+    octopus_headers,
+)
+
 base_url = os.environ.get("EASY_MODE_MCP_BASE_URL", "http://localhost:8000")
 
-# Auth type: "google", "github", or "none" (default: "google")
+# Auth type: "google", "github", "azure", "oauth_proxy", or "none" (default: "google")
 AUTH_TYPE = os.environ.get("EASY_MODE_MCP_AUTH_TYPE", "google").lower()
 AUTH_ENABLED = AUTH_TYPE != "none"
 
@@ -29,11 +50,6 @@ class InterventionResponse(BaseModel):
     """Choose whether to proceed with or abort the deployment, and provide any instructions."""
     action: str = Field(title="Action", description="Choose whether to proceed with or reject the deployment", json_schema_extra={"enum": ["Proceed", "Reject Deployment"]})
     instructions: str = Field(default="", title="Instructions", description="Additional instructions or notes for this intervention")
-
-# Octopus Deploy configuration from environment
-OCTOPUS_URL = os.environ["EASY_MODE_MCP_OCTOPUS_URL"]
-OCTOPUS_API_KEY = os.environ["EASY_MODE_MCP_OCTOPUS_API_KEY"]
-OCTOPUS_SPACE_ID = os.environ["EASY_MODE_MCP_OCTOPUS_SPACE_ID"]
 
 # Optional: comma-separated list of project names to expose (empty = all projects)
 OCTOPUS_PROJECT_FILTER = [
@@ -140,98 +156,10 @@ async def _app_lifespan(app: FastMCP):
 mcp = FastMCP("OctopusEasyMode", auth=auth, lifespan=_app_lifespan)
 
 
-async def exchange_token_for_octopus_token(id_token: str) -> str:
-    """Exchange a Google ID token for an Octopus access token via token exchange.
-
-    Args:
-        id_token: The Google ID token (JWT) to exchange.
-
-    Returns:
-        The Octopus access token.
-
-    Raises:
-        RuntimeError: If the token exchange fails or no access token is returned.
-    """
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"{OCTOPUS_URL}/token/v1",
-            json={
-                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
-                "audience": os.environ["EASY_MODE_MCP_OCTOPUS_AUDIENCE"],
-                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
-                "subject_token": id_token,
-            },
-        )
-
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"Token exchange failed with status {response.status_code}: {response.text}"
-            )
-
-        token_data = response.json()
-
-        if not token_data.get("access_token"):
-            raise RuntimeError("Authentication error: Unable to get Octopus token")
-
-        return token_data["access_token"]
-
-
-def _octopus_headers(bearer_token: str | None = None) -> dict[str, str]:
-    if bearer_token:
-        return {"Authorization": f"Bearer {bearer_token}"}
-    return {"X-Octopus-ApiKey": OCTOPUS_API_KEY}
-
-
 def _sanitize_tool_name(name: str) -> str:
     """Convert a runbook name into a valid MCP tool name."""
     sanitized = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
     return sanitized.strip("_")[:64]
-
-
-async def _get_all_runbooks() -> list[dict]:
-    """Fetch all runbooks from the Octopus space."""
-    runbooks = []
-    skip = 0
-    take = 30
-    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=_octopus_headers()) as client:
-        while True:
-            resp = await client.get(
-                f"/api/{OCTOPUS_SPACE_ID}/runbooks",
-                params={"skip": skip, "take": take},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            items = data.get("Items", [])
-            runbooks.extend(items)
-            if skip + take >= data.get("TotalResults", 0):
-                break
-            skip += take
-    return runbooks
-
-
-async def _get_project_prompted_variables(project_id: str) -> list[dict]:
-    """Fetch prompted variables for a project."""
-    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=_octopus_headers()) as client:
-        variable_set_id = f"variableset-{project_id}"
-        resp = await client.get(f"/api/{OCTOPUS_SPACE_ID}/variables/{variable_set_id}")
-        resp.raise_for_status()
-        data = resp.json()
-        prompted = []
-        for var in data.get("Variables", []):
-            prompt = var.get("Prompt")
-            if prompt:
-                scope = var.get("Scope", {})
-                process_owners = scope.get("ProcessOwner", [])
-                prompted.append({
-                    "id": var["Id"],
-                    "name": var["Name"],
-                    "label": prompt.get("Label", var["Name"]),
-                    "description": prompt.get("Description", ""),
-                    "required": prompt.get("Required", False),
-                    "default": var.get("Value", ""),
-                    "process_owners": process_owners,
-                })
-        return prompted
 
 
 def _sanitize_param_name(name: str) -> str:
@@ -241,383 +169,233 @@ def _sanitize_param_name(name: str) -> str:
     return sanitized.strip("_").lower()
 
 
-async def _get_runbook_preview_form(client: httpx.AsyncClient, snapshot_id: str, environment_id: str) -> tuple[list[dict], dict[str, str]]:
-    """Fetch the runbook run preview and return form elements and default values.
+async def _handle_intervention(client: httpx.AsyncClient, interruption: dict, ctx: Context, task_id: str, task: dict) -> dict | None:
+    """Handle a single manual intervention. Returns a result dict if the task should stop, else None."""
+    instructions, notes_element_id, result_element_id = parse_interruption_form(interruption)
 
-    Returns:
-        A tuple of (elements, form_values) where elements is the list of form elements
-        and form_values is a dict of default form values.
-    """
-    resp = await client.get(
-        f"/api/{OCTOPUS_SPACE_ID}/runbookSnapshots/{snapshot_id}/runbookRuns/preview/{environment_id}"
+    title = interruption.get("Title", "Manual Intervention")
+    message = f"**{title}**\n\n{instructions}" if instructions else title
+
+    # Ask the user to take responsibility or cancel
+    responsibility_result = await ctx.elicit(
+        message=f"{message}\n\nDo you want to take responsibility for this intervention?",
+        response_type=["Assign to me", "Cancel"],
+        response_title="Responsibility",
+        response_description="Choose whether to assign this intervention to yourself or cancel",
     )
-    resp.raise_for_status()
-    preview = resp.json()
-    form = preview.get("Form", {})
-    elements = form.get("Elements", [])
 
-    # Start with default form values from the preview
-    form_values = dict(form.get("Values", {}))
+    if not isinstance(responsibility_result, AcceptedElicitation) or responsibility_result.data == "Cancel":
+        logger.info(f"User cancelled taking responsibility for interruption '{interruption['Id']}'")
+        return {
+            "status": "Cancelled",
+            "taskId": task_id,
+            "description": task.get("Description", ""),
+            "errorMessage": "User declined to take responsibility for the manual intervention.",
+        }
 
-    return elements, form_values
+    # Take responsibility and elicit a response
+    await take_interruption_responsibility(client, interruption['Id'])
+    result = await ctx.elicit(
+        message=message,
+        response_type=InterventionResponse,
+    )
 
+    if isinstance(result, AcceptedElicitation):
+        action = result.data.action
+        user_instructions = result.data.instructions
+    else:
+        action = "Reject Deployment"
+        user_instructions = ""
 
-async def _create_runbook_run(client: httpx.AsyncClient, runbook_id: str, snapshot_id: str, environment_id: str, form_values: dict[str, str], tenant_id: str | None = None) -> str:
-    """Create a runbook run and return the task ID.
+    notes_text = f"Responded via MCP: {action}"
+    if user_instructions:
+        notes_text += f"\nInstructions: {user_instructions}"
 
-    Args:
-        client: The HTTP client to use
-        runbook_id: The runbook to run
-        snapshot_id: The published runbook snapshot ID
-        environment_id: The environment to run in
-        form_values: Form values to submit with the run
-        tenant_id: Optional tenant ID for tenanted runs
-
-    Returns:
-        The server task ID for the created run.
-    """
-    payload = {
-        "RunbookId": runbook_id,
-        "RunbookSnapshotId": snapshot_id,
-        "EnvironmentId": environment_id,
+    submit_payload = {
+        "Instructions": None,
+        "Notes": notes_text,
+        "Result": action,
     }
-    if form_values:
-        payload["FormValues"] = form_values
-    if tenant_id:
-        payload["TenantId"] = tenant_id
 
-    resp = await client.post(
-        f"/api/{OCTOPUS_SPACE_ID}/runbookRuns",
-        json=payload,
-    )
-    resp.raise_for_status()
-    run = resp.json()
-    return run["TaskId"]
+    logger.info(f"Submitting intervention with payload: {submit_payload}")
+    await submit_interruption(client, interruption['Id'], submit_payload)
+    logger.info(f"Manual intervention '{title}' resolved with: {action}")
+    return None
 
 
-async def _get_task_raw_log(client: httpx.AsyncClient, task_id: str) -> str:
-    """Download the raw log for a server task.
-
-    Args:
-        client: The HTTP client to use
-        task_id: The server task ID
-
-    Returns:
-        The raw log text.
-    """
-    log_resp = await client.get(f"/api/tasks/{task_id}/raw")
-    log_resp.raise_for_status()
-    return log_resp.text
+async def _handle_pending_interventions(client: httpx.AsyncClient, task_id: str, task: dict, ctx: Context) -> dict | None:
+    """Process all pending interventions for a task. Returns a result dict if the task should stop."""
+    interruptions = await get_pending_interruptions(client, task_id)
+    for interruption in interruptions:
+        if not interruption.get("IsPending"):
+            continue
+        logger.info(f"Interruption details: {interruption}")
+        stop_result = await _handle_intervention(client, interruption, ctx, task_id, task)
+        if stop_result:
+            return stop_result
+    return None
 
 
-async def _get_task_status(client: httpx.AsyncClient, task_id: str) -> dict:
-    """Fetch a server task and return its JSON representation.
+async def _poll_task_to_completion(client: httpx.AsyncClient, task_id: str, ctx: Context | None = None) -> dict:
+    """Poll a server task until it completes, handling interventions along the way."""
+    while True:
+        task = await get_task_status(client, task_id)
+        state = task.get("State")
 
-    Args:
-        client: The HTTP client to use
-        task_id: The server task ID to fetch
+        if state in ("Success", "Failed", "Canceled", "TimedOut"):
+            raw_log = await get_task_raw_log(client, task_id)
+            return build_task_result(task, task_id, raw_log)
 
-    Returns:
-        The task JSON dict.
-    """
-    resp = await client.get(f"/api/tasks/{task_id}")
-    resp.raise_for_status()
-    return resp.json()
+        if task.get("HasPendingInterruptions") and ctx:
+            stop_result = await _handle_pending_interventions(client, task_id, task, ctx)
+            if stop_result:
+                return stop_result
 
-
-async def _get_pending_interruptions(client: httpx.AsyncClient, task_id: str) -> list[dict]:
-    """Fetch pending interruptions for a server task.
-
-    Args:
-        client: The HTTP client to use
-        task_id: The server task ID
-
-    Returns:
-        A list of pending interruption dicts.
-    """
-    resp = await client.get(
-        f"/api/{OCTOPUS_SPACE_ID}/interruptions",
-        params={"regarding": task_id, "pendingOnly": "true"},
-    )
-    resp.raise_for_status()
-    return resp.json().get("Items", [])
-
-
-async def _submit_interruption(client: httpx.AsyncClient, interruption_id: str, payload: dict) -> None:
-    """Submit a response to a manual intervention interruption.
-
-    Args:
-        client: The HTTP client to use
-        interruption_id: The interruption ID to submit a response for
-        payload: The submission payload dict
-    """
-    resp = await client.post(
-        f"/api/{OCTOPUS_SPACE_ID}/interruptions/{interruption_id}/submit",
-        json=payload,
-    )
-    if resp.status_code != 200:
-        logger.error(f"Intervention submit failed: {resp.status_code} {resp.text}")
-    resp.raise_for_status()
-
-
-async def _take_interruption_responsibility(client: httpx.AsyncClient, interruption_id: str) -> None:
-    """Take responsibility for a manual intervention interruption.
-
-    Args:
-        client: The HTTP client to use
-        interruption_id: The interruption ID to take responsibility for
-    """
-    resp = await client.put(
-        f"/api/{OCTOPUS_SPACE_ID}/interruptions/{interruption_id}/responsible",
-    )
-    if resp.status_code != 200:
-        logger.error(f"Taking responsibility failed: {resp.status_code} {resp.text}")
-    resp.raise_for_status()
-    logger.info(f"Took responsibility for interruption '{interruption_id}'")
-
-
-def _parse_interruption_form(interruption: dict) -> tuple[str, str | None, str | None]:
-    """Parse an interruption's form to extract instructions and element IDs.
-
-    Args:
-        interruption: The interruption JSON dict
-
-    Returns:
-        A tuple of (instructions, notes_element_id, result_element_id).
-    """
-    form = interruption.get("Form", {})
-    elements = form.get("Elements", [])
-    instructions = ""
-    notes_element_id = None
-    result_element_id = None
-    for element in elements:
-        control = element.get("Control", {})
-        control_type = control.get("Type", "")
-        if control_type == "Paragraph":
-            instructions = control.get("Text", "")
-        elif control_type == "TextArea":
-            notes_element_id = element.get("Name", "")
-        elif control_type == "Select":
-            result_element_id = element.get("Name", "")
-    return instructions, notes_element_id, result_element_id
-
-
-async def _resolve_tenant(client: httpx.AsyncClient, tenant_name: str, project_id: str, environment_id: str) -> tuple[str | None, str | None]:
-    """Resolve a tenant name to an ID and validate it's linked to the project and environment.
-
-    Returns:_resolve_tenant
-        A tuple of (tenant_id, error_message). If successful, error_message is None.
-    """
-    resp = await client.get(
-        f"/api/{OCTOPUS_SPACE_ID}/tenants",
-        params={"partialName": tenant_name, "take": 100},
-    )
-    resp.raise_for_status()
-    tenants = resp.json().get("Items", [])
-
-    # Find exact match
-    tenant = None
-    for t in tenants:
-        if t["Name"].lower() == tenant_name.lower():
-            tenant = t
-            break
-
-    if tenant is None:
-        available = [t["Name"] for t in tenants[:10]]
-        return None, f"Tenant '{tenant_name}' not found. Partial matches: {available}"
-
-    tenant_id = tenant["Id"]
-
-    # Fetch full tenant details to check project/environment linkage
-    detail_resp = await client.get(f"/api/{OCTOPUS_SPACE_ID}/tenants/{tenant_id}")
-    detail_resp.raise_for_status()
-    tenant_detail = detail_resp.json()
-
-    project_envs = tenant_detail.get("ProjectEnvironments", {})
-    if project_id not in project_envs:
-        return None, f"Tenant '{tenant_name}' is not linked to project '{project_id}'."
-
-    linked_envs = project_envs[project_id]
-    if environment_id not in linked_envs:
-        return None, f"Tenant '{tenant_name}' is not linked to environment '{environment_id}' for this project."
-
-    return tenant_id, None
-
-
-async def _get_published_snapshot_id(client: httpx.AsyncClient, runbook_id: str) -> str | None:
-    """Fetch a runbook and return its published snapshot ID.
-
-    Args:
-        client: The HTTP client to use
-        runbook_id: The runbook ID
-
-    Returns:
-        The published runbook snapshot ID, or None if not published.
-    """
-    resp = await client.get(f"/api/{OCTOPUS_SPACE_ID}/runbooks/{runbook_id}")
-    resp.raise_for_status()
-    runbook = resp.json()
-    return runbook.get("PublishedRunbookSnapshotId")
+        await asyncio.sleep(5)
 
 
 async def _run_runbook(runbook_id: str, environment_id: str, variable_values: dict[str, str] | None = None, ctx: Context | None = None, tenant_id: str | None = None, project_id: str | None = None) -> dict:
-    """Trigger a runbook run and poll for completion, returning the final task status.
-
-    Args:
-        runbook_id: The runbook to run
-        environment_id: The environment to run in
-        variable_values: Dict mapping variable names to their values for prompted variables
-        ctx: MCP context for elicitation during manual interventions
-        tenant_id: Optional tenant ID for tenanted runs
-        project_id: Optional project ID for tenant validation
-    """
-    if AUTH_ENABLED:
-        # Exchange the user's Google ID token for an Octopus access token
-        google_access_token = get_access_token()
-        access_token = await exchange_token_for_octopus_token(google_access_token.id_token)
-        headers = _octopus_headers(access_token)
-    else:
-        # Use API key directly when auth is disabled
-        headers = _octopus_headers()
+    """Trigger a runbook run and poll for completion, returning the final task status."""
+    headers = await get_authenticated_headers()
 
     async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=headers) as client:
-        # Get the published runbook snapshot
-        snapshot_id = await _get_published_snapshot_id(client, runbook_id)
+        snapshot_id = await get_published_snapshot_id(client, runbook_id)
         if not snapshot_id:
             return {"status": "Failed", "error": "Runbook has no published snapshot"}
 
-        # Build FormValues by resolving variable names to form element IDs from the snapshot preview
         form_values = {}
         if variable_values:
-            elements, form_values = await _get_runbook_preview_form(client, snapshot_id, environment_id)
+            form_values = await build_form_values(client, snapshot_id, environment_id, variable_values)
 
-            logger.info(f"Form elements: {[(e.get('Name'), e.get('Control', {})) for e in elements]}")
-            logger.info(f"Form default values: {form_values}")
-
-            # Map variable names to form element IDs and override defaults
-            for element in elements:
-                element_id = element.get("Name", "")
-                control = element.get("Control", {})
-                control_label = control.get("Label", "")
-                control_name = control.get("Name", "")
-                control_description = control.get("Description", "")
-
-                for var_name, var_value in variable_values.items():
-                    # Try matching by control label, control name, element ID, or description
-                    if var_name in (control_label, control_name, element_id, control_description):
-                        form_values[element_id] = var_value
-                        logger.info(f"Mapped variable '{var_name}' to form element '{element_id}' = '{var_value}'")
-                        break
-
-            if variable_values and not any(
-                var_name in (e.get("Control", {}).get("Label", ""), e.get("Control", {}).get("Name", ""), e.get("Name", ""))
-                for e in elements
-                for var_name in variable_values.keys()
-            ):
-                logger.warning(
-                    f"Could not map any variables to form elements. "
-                    f"Variables: {list(variable_values.keys())}, "
-                    f"Elements: {[(e.get('Name'), e.get('Control', {}).get('Label'), e.get('Control', {}).get('Name')) for e in elements]}"
-                )
-
-        # Create the runbook run
-        task_id = await _create_runbook_run(client, runbook_id, snapshot_id, environment_id, form_values, tenant_id=tenant_id)
-
-        # Poll the server task until completion
-        while True:
-            task = await _get_task_status(client, task_id)
-            state = task.get("State")
-            if state in ("Success", "Failed", "Canceled", "TimedOut"):
-                # Download the task logs
-                raw_log = await _get_task_raw_log(client, task_id)
-
-                return {
-                    "status": state,
-                    "taskId": task_id,
-                    "description": task.get("Description", ""),
-                    "errorMessage": task.get("ErrorMessage", ""),
-                    "duration": task.get("Duration", ""),
-                    "logs": raw_log,
-                }
-
-            # Check for pending manual interventions
-            if task.get("HasPendingInterruptions") and ctx:
-                interruptions = await _get_pending_interruptions(client, task_id)
-
-                for interruption in interruptions:
-                    if not interruption.get("IsPending"):
-                        continue
-
-                    logger.info(f"Interruption details: {interruption}")
-
-                    # Extract intervention instructions from the form
-                    instructions, notes_element_id, result_element_id = _parse_interruption_form(interruption)
-
-                    # Build the elicitation message
-                    title = interruption.get("Title", "Manual Intervention")
-                    guidance_options = interruption.get("ResponsibleTeamIds", [])
-                    message = f"**{title}**\n\n{instructions}" if instructions else title
-
-                    # First, ask the user to take responsibility or cancel
-                    responsibility_result = await ctx.elicit(
-                        message=f"{message}\n\nDo you want to take responsibility for this intervention?",
-                        response_type=["Assign to me", "Cancel"],
-                        response_title="Responsibility",
-                        response_description="Choose whether to assign this intervention to yourself or cancel",
-                    )
-
-                    if not isinstance(responsibility_result, AcceptedElicitation) or responsibility_result.data == "Cancel":
-                        logger.info(f"User cancelled taking responsibility for interruption '{interruption['Id']}'")
-                        return {
-                            "status": "Cancelled",
-                            "taskId": task_id,
-                            "description": task.get("Description", ""),
-                            "errorMessage": "User declined to take responsibility for the manual intervention.",
-                        }
-
-                    # Take responsibility for the interruption
-                    await _take_interruption_responsibility(client, interruption['Id'])
-                    # Then, elicit a response to proceed or abort with instructions
-                    result = await ctx.elicit(
-                        message=message,
-                        response_type=InterventionResponse,
-                    )
-
-                    if isinstance(result, AcceptedElicitation):
-                        action = result.data.action
-                        user_instructions = result.data.instructions
-                    else:
-                        # User declined or cancelled the elicitation - reject the deployment
-                        action = "Reject Deployment"
-                        user_instructions = ""
-
-                    notes_text = f"Responded via MCP: {action}"
-                    if user_instructions:
-                        notes_text += f"\nInstructions: {user_instructions}"
-
-                    submit_payload = {
-                        "Instructions": None,
-                        "Notes": notes_text,
-                        "Result": action,
-                    }
-
-                    logger.info(f"Submitting intervention with payload: {submit_payload}")
-
-                    await _submit_interruption(client, interruption['Id'], submit_payload)
-                    logger.info(f"Manual intervention '{title}' resolved with: {action}")
-
-            await asyncio.sleep(5)
+        task_id = await create_runbook_run(client, runbook_id, snapshot_id, environment_id, form_values, tenant_id=tenant_id)
+        return await _poll_task_to_completion(client, task_id, ctx)
 
 
-async def _get_environments() -> list[dict]:
-    """Fetch all environments from the Octopus space."""
-    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=_octopus_headers()) as client:
-        resp = await client.get(
-            f"/api/{OCTOPUS_SPACE_ID}/environments",
-            params={"take": 1000},
+def _build_tool_params(single_env: bool, EnvironmentEnum, param_to_var: dict, is_tenanted: bool, multi_tenancy_mode: str) -> list[inspect.Parameter]:
+    """Build the list of inspect.Parameter objects for a runbook tool."""
+    if single_env:
+        params = [
+            inspect.Parameter("ctx", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Context),
+        ]
+    else:
+        params = [
+            inspect.Parameter("ctx", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Context),
+            inspect.Parameter("environment_name", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=EnvironmentEnum),
+        ]
+
+    for param_name, var in param_to_var.items():
+        default = var["default"] if var["default"] else (inspect.Parameter.empty if var["required"] else None)
+        params.append(
+            inspect.Parameter(
+                param_name,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                default=default,
+                annotation=str | None if not var["required"] else str,
+            )
         )
-        resp.raise_for_status()
-        return resp.json().get("Items", [])
+
+    if is_tenanted:
+        tenant_required = multi_tenancy_mode == "Tenanted"
+        params.append(
+            inspect.Parameter(
+                "tenant_name",
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                default=inspect.Parameter.empty if tenant_required else None,
+                annotation=str if tenant_required else str | None,
+            )
+        )
+
+    # Sort: ctx first, then required, then optional
+    ctx_params = [p for p in params if p.name == "ctx"]
+    required_params = [p for p in params if p.name != "ctx" and p.default is inspect.Parameter.empty]
+    optional_params = [p for p in params if p.name != "ctx" and p.default is not inspect.Parameter.empty]
+    return ctx_params + required_params + optional_params
+
+
+def _build_tool_docstring(description: str, project_id: str, env_help: str, single_env: bool, is_tenanted: bool, multi_tenancy_mode: str, param_to_var: dict) -> str:
+    """Build the docstring for a runbook tool."""
+    if single_env:
+        args_doc = ""
+    else:
+        args_doc = "    environment_name: The name of the environment to run the runbook in\n"
+    if is_tenanted:
+        tenant_req_str = " (required)" if multi_tenancy_mode == "Tenanted" else " (optional)"
+        args_doc += f"    tenant_name: The name of the tenant to run the runbook for{tenant_req_str}\n"
+    for param_name, var in param_to_var.items():
+        required_str = " (required)" if var["required"] else " (optional)"
+        var_desc = var["description"] or var["label"]
+        args_doc += f"    {param_name}: {var_desc}{required_str}\n"
+
+    return (
+        f"{description}\n\n"
+        f"Project ID: {project_id}\n"
+        f"Available environments: {env_help}\n\n"
+        f"Args:\n"
+        f"{args_doc}"
+    )
+
+
+def _build_tool_annotations(single_env: bool, EnvironmentEnum, is_tenanted: bool, multi_tenancy_mode: str, param_to_var: dict) -> dict:
+    """Build the __annotations__ dict for a runbook tool."""
+    annotations = {"return": dict, "ctx": Context}
+    if not single_env:
+        annotations["environment_name"] = EnvironmentEnum
+    if is_tenanted:
+        annotations["tenant_name"] = str if multi_tenancy_mode == "Tenanted" else str | None
+    for param_name, var in param_to_var.items():
+        annotations[param_name] = str | None if not var["required"] else str
+    return annotations
+
+
+async def _resolve_environment(environment_name: str, environments: list[dict]) -> tuple[str | None, str | None]:
+    """Resolve an environment name to its ID."""
+    env_map = {e["Name"].lower(): e["Id"] for e in environments}
+    env_id = env_map.get(environment_name.lower())
+    if not env_id:
+        env_help = ", ".join(e["Name"] for e in environments)
+        return None, f"Environment '{environment_name}' not found. Available: {env_help}"
+    return env_id, None
+
+
+async def _collect_variable_values(kwargs: dict, param_to_var: dict, ctx: Context | None) -> tuple[dict[str, str], dict | None]:
+    """Collect variable values from kwargs, eliciting missing required values."""
+    variable_values = {}
+    for param_name, var in param_to_var.items():
+        value = kwargs.get(param_name)
+        if value is not None:
+            variable_values[var["name"]] = value
+        elif var["required"] and not var["default"] and ctx:
+            var_desc = var["description"] or var["label"]
+            elicit_result = await ctx.elicit(
+                message=f"Please provide a value for **{var['label']}**\n\n{var_desc}",
+                response_type=str,
+            )
+            if isinstance(elicit_result, AcceptedElicitation):
+                variable_values[var["name"]] = elicit_result.data
+            else:
+                return {}, {
+                    "status": "Failed",
+                    "error": f"Required variable '{var['label']}' was not provided and user declined to supply a value.",
+                }
+    return variable_values, None
+
+
+async def _resolve_tenant_for_tool(kwargs: dict, is_tenanted: bool, multi_tenancy_mode: str, project_id: str, env_id: str) -> tuple[str | None, dict | None]:
+    """Resolve tenant name from kwargs to a tenant ID."""
+    if not is_tenanted:
+        return None, None
+
+    tenant_name_val = kwargs.get("tenant_name")
+    if tenant_name_val:
+        headers = await get_authenticated_headers()
+        async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=headers) as tenant_client:
+            resolved_tenant_id, error = await resolve_tenant(tenant_client, tenant_name_val, project_id, env_id)
+            if error:
+                return None, {"status": "Failed", "error": error}
+            return resolved_tenant_id, None
+    elif multi_tenancy_mode == "Tenanted":
+        return None, {"status": "Failed", "error": "Tenant name is required for this runbook."}
+    return None, None
 
 
 def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_variables: list[dict]) -> None:
@@ -639,7 +417,7 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
     env_help = ", ".join(env_names) if env_names else "No environments found"
     single_env = len(environments) == 1
 
-    # Create a dynamic Enum for environment names to provide a dropdown list
+    # Create a dynamic Enum for environment names
     if not single_env and env_names:
         EnvironmentEnum = Enum(
             f"Environment_{_sanitize_tool_name(runbook_name)}",
@@ -655,154 +433,35 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
         param_name = _sanitize_param_name(var["name"])
         param_to_var[param_name] = var
 
-    # Build function parameters dynamically
-    # If there's only one environment, don't include environment_name as a parameter
-    if single_env:
-        params = [
-            inspect.Parameter("ctx", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Context),
-        ]
-    else:
-        params = [
-            inspect.Parameter("ctx", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Context),
-            inspect.Parameter("environment_name", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=EnvironmentEnum),
-        ]
-    for param_name, var in param_to_var.items():
-        default = var["default"] if var["default"] else (inspect.Parameter.empty if var["required"] else None)
-        params.append(
-            inspect.Parameter(
-                param_name,
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                default=default,
-                annotation=str | None if not var["required"] else str,
-            )
-        )
-
-    # Add tenant_name parameter for tenanted runbooks
-    if is_tenanted:
-        tenant_required = multi_tenancy_mode == "Tenanted"
-        params.append(
-            inspect.Parameter(
-                "tenant_name",
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                default=inspect.Parameter.empty if tenant_required else None,
-                annotation=str if tenant_required else str | None,
-            )
-        )
-
-    # Sort params so that required (no default) come before optional (have default)
-    # Keep ctx first always
-    ctx_params = [p for p in params if p.name == "ctx"]
-    required_params = [p for p in params if p.name != "ctx" and p.default is inspect.Parameter.empty]
-    optional_params = [p for p in params if p.name != "ctx" and p.default is not inspect.Parameter.empty]
-    params = ctx_params + required_params + optional_params
+    params = _build_tool_params(single_env, EnvironmentEnum, param_to_var, is_tenanted, multi_tenancy_mode)
 
     async def run_tool(**kwargs) -> dict:
         """placeholder"""
         ctx = kwargs.pop("ctx", None)
         environment_name = kwargs.get("environment_name", environments[0]["Name"] if single_env else None)
         if not environment_name:
-            return {
-                "status": "Failed",
-                "error": f"Environment name is required. Available: {env_help}",
-            }
-        # Resolve environment name to ID
-        env_map = {e["Name"].lower(): e["Id"] for e in environments}
-        env_id: str | None = env_map.get(environment_name.lower())
-        if not env_id:
-            return {
-                "status": "Failed",
-                "error": f"Environment '{environment_name}' not found. Available: {env_help}",
-            }
+            return {"status": "Failed", "error": f"Environment name is required. Available: {env_help}"}
 
-        # Build variable values from prompted variable arguments (keyed by variable name)
-        variable_values = {}
-        for param_name, var in param_to_var.items():
-            value = kwargs.get(param_name)
-            if value is not None:
-                variable_values[var["name"]] = value
-            elif var["required"] and not var["default"] and ctx:
-                # Elicit the value from the user for required variables with no default
-                var_desc = var["description"] or var["label"]
-                elicit_result = await ctx.elicit(
-                    message=f"Please provide a value for **{var['label']}**\n\n{var_desc}",
-                    response_type=str,
-                )
-                if isinstance(elicit_result, AcceptedElicitation):
-                    variable_values[var["name"]] = elicit_result.data
-                else:
-                    return {
-                        "status": "Failed",
-                        "error": f"Required variable '{var['label']}' was not provided and user declined to supply a value.",
-                    }
+        env_id, env_error = await _resolve_environment(environment_name, environments)
+        if env_error:
+            return {"status": "Failed", "error": env_error}
 
-        # Resolve tenant name to ID if provided
-        resolved_tenant_id = None
-        if is_tenanted:
-            tenant_name_val = kwargs.get("tenant_name")
-            if tenant_name_val:
-                if AUTH_ENABLED:
-                    google_access_token = get_access_token()
-                    access_token = await exchange_token_for_octopus_token(google_access_token.id_token)
-                    tenant_headers = _octopus_headers(access_token)
-                else:
-                    tenant_headers = _octopus_headers()
-                async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=tenant_headers) as tenant_client:
-                    resolved_tenant_id, error = await _resolve_tenant(tenant_client, tenant_name_val, project_id, env_id)
-                    if error:
-                        return {"status": "Failed", "error": error}
-            elif multi_tenancy_mode == "Tenanted":
-                return {"status": "Failed", "error": "Tenant name is required for this runbook."}
+        variable_values, var_error = await _collect_variable_values(kwargs, param_to_var, ctx)
+        if var_error:
+            return var_error
+
+        resolved_tenant_id, tenant_error = await _resolve_tenant_for_tool(kwargs, is_tenanted, multi_tenancy_mode, project_id, env_id)
+        if tenant_error:
+            return tenant_error
 
         return await _run_runbook(runbook_id, env_id, variable_values if variable_values else None, ctx=ctx, tenant_id=resolved_tenant_id, project_id=project_id)
 
-    # Build docstring with prompted variable info
-    if single_env:
-        args_doc = ""
-    else:
-        args_doc = "    environment_name: The name of the environment to run the runbook in\n"
-    if is_tenanted:
-        tenant_req_str = " (required)" if multi_tenancy_mode == "Tenanted" else " (optional)"
-        args_doc += f"    tenant_name: The name of the tenant to run the runbook for{tenant_req_str}\n"
-    for param_name, var in param_to_var.items():
-        required_str = " (required)" if var["required"] else " (optional)"
-        var_desc = var["description"] or var["label"]
-        args_doc += f"    {param_name}: {var_desc}{required_str}\n"
-
-    run_tool.__doc__ = (
-        f"{description}\n\n"
-        f"Project ID: {project_id}\n"
-        f"Available environments: {env_help}\n\n"
-        f"Args:\n"
-        f"{args_doc}"
-    )
+    run_tool.__doc__ = _build_tool_docstring(description, project_id, env_help, single_env, is_tenanted, multi_tenancy_mode, param_to_var)
     run_tool.__name__ = tool_name
-
-    # Apply the dynamic signature and annotations
-    sig = inspect.Signature(params)
-    run_tool.__signature__ = sig
-
-    # Set __annotations__ so that typing.get_type_hints() can resolve them
-    annotations = {"return": dict, "ctx": Context}
-    if not single_env:
-        annotations["environment_name"] = EnvironmentEnum
-    if is_tenanted:
-        annotations["tenant_name"] = str if multi_tenancy_mode == "Tenanted" else str | None
-    for param_name, var in param_to_var.items():
-        annotations[param_name] = str | None if not var["required"] else str
-    run_tool.__annotations__ = annotations
+    run_tool.__signature__ = inspect.Signature(params)
+    run_tool.__annotations__ = _build_tool_annotations(single_env, EnvironmentEnum, is_tenanted, multi_tenancy_mode, param_to_var)
 
     mcp.tool(name=tool_name, description=description, task=True)(run_tool)
-
-
-async def _get_runbook_environments(runbook: dict) -> list[dict]:
-    """Fetch environments available for a runbook via its RunbookEnvironments link."""
-    environments_link = runbook.get("Links", {}).get("RunbookEnvironments")
-    if not environments_link:
-        return []
-    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=_octopus_headers()) as client:
-        resp = await client.get(environments_link)
-        resp.raise_for_status()
-        return resp.json()
 
 
 async def _remove_all_tools() -> None:
@@ -815,29 +474,13 @@ async def _remove_all_tools() -> None:
             logger.warning(f"Failed to remove tool '{tool.name}': {e}")
 
 
-async def _get_project_ids_by_names(project_names: list[str]) -> set[str]:
-    """Fetch project IDs for the given project names."""
-    project_ids = set()
-    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=_octopus_headers()) as client:
-        for name in project_names:
-            resp = await client.get(
-                f"/api/{OCTOPUS_SPACE_ID}/projects",
-                params={"partialName": name, "take": 100},
-            )
-            resp.raise_for_status()
-            for project in resp.json().get("Items", []):
-                if project["Name"].lower() == name.lower():
-                    project_ids.add(project["Id"])
-    return project_ids
-
-
 async def register_all_runbook_tools() -> None:
     """Fetch runbooks and environments, then register each runbook as a tool."""
     await _remove_all_tools()
 
     runbooks, environments = await asyncio.gather(
-        _get_all_runbooks(),
-        _get_environments(),
+        get_all_runbooks(),
+        get_environments(),
     )
 
     # Only include runbooks that have a published snapshot
@@ -845,21 +488,21 @@ async def register_all_runbook_tools() -> None:
 
     # Filter by project names if configured
     if OCTOPUS_PROJECT_FILTER:
-        allowed_project_ids = await _get_project_ids_by_names(OCTOPUS_PROJECT_FILTER)
+        allowed_project_ids = await get_project_ids_by_names(OCTOPUS_PROJECT_FILTER)
         runbooks = [rb for rb in runbooks if rb.get("ProjectId") in allowed_project_ids]
         logger.info(f"Filtered to {len(runbooks)} runbooks from projects: {OCTOPUS_PROJECT_FILTER}")
 
     # Fetch prompted variables for each unique project
     project_ids = list({rb.get("ProjectId", "") for rb in runbooks if rb.get("ProjectId")})
     project_vars = await asyncio.gather(
-        *[_get_project_prompted_variables(pid) for pid in project_ids]
+        *[get_project_prompted_variables(pid) for pid in project_ids]
     )
     project_prompted_vars = dict(zip(project_ids, project_vars))
 
     # Fetch lifecycle environments for runbooks with FromProjectLifecycles scope
     lifecycle_runbooks = [rb for rb in runbooks if rb.get("EnvironmentScope") == "FromProjectLifecycles"]
     lifecycle_envs = await asyncio.gather(
-        *[_get_runbook_environments(rb) for rb in lifecycle_runbooks]
+        *[get_runbook_environments(rb) for rb in lifecycle_runbooks]
     )
     lifecycle_env_map = {rb["Id"]: envs for rb, envs in zip(lifecycle_runbooks, lifecycle_envs)}
 
