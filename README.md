@@ -38,6 +38,12 @@ An MCP (Model Context Protocol) server that exposes Octopus Deploy runbooks as t
 | `EASY_MODE_MCP_AZURE_STORAGE_CONNECTION_STRING` | Azure Table Storage connection string for session/state storage |
 | `EASY_MODE_MCP_JWT_SIGNING_KEY` | Secret key for signing JWT tokens |
 
+Generate a signing key with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
 ### Required when `EASY_MODE_MCP_AUTH_TYPE=google` (default)
 
 | Variable | Description |
