@@ -220,6 +220,8 @@ async def _get_project_prompted_variables(project_id: str) -> list[dict]:
         for var in data.get("Variables", []):
             prompt = var.get("Prompt")
             if prompt:
+                scope = var.get("Scope", {})
+                process_owners = scope.get("ProcessOwner", [])
                 prompted.append({
                     "id": var["Id"],
                     "name": var["Name"],
@@ -227,6 +229,7 @@ async def _get_project_prompted_variables(project_id: str) -> list[dict]:
                     "description": prompt.get("Description", ""),
                     "required": prompt.get("Required", False),
                     "default": var.get("Value", ""),
+                    "process_owners": process_owners,
                 })
         return prompted
 
@@ -777,7 +780,15 @@ async def register_all_runbook_tools() -> None:
     lifecycle_env_map = {rb["Id"]: envs for rb, envs in zip(lifecycle_runbooks, lifecycle_envs)}
 
     for runbook in runbooks:
-        prompted = project_prompted_vars.get(runbook.get("ProjectId", ""), [])
+        all_prompted = project_prompted_vars.get(runbook.get("ProjectId", ""), [])
+        runbook_id = runbook["Id"]
+
+        # Filter prompted variables: include only those with no ProcessOwner scope
+        # or where this runbook is listed as a process owner
+        prompted = [
+            var for var in all_prompted
+            if not var.get("process_owners") or runbook_id in var["process_owners"]
+        ]
 
         # Filter environments based on the runbook's EnvironmentScope
         scope = runbook.get("EnvironmentScope")
