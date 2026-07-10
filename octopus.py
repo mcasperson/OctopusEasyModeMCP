@@ -337,22 +337,58 @@ async def create_runbook_snapshot(client: httpx.AsyncClient, runbook_id: str, se
     return snapshot["Id"]
 
 
+async def get_db_runbook_process(client: httpx.AsyncClient, project_id: str, runbook_process_id: str) -> dict:
+    """Fetch the runbook process for a database-backed runbook.
+
+    Args:
+        client: The HTTP client to use
+        project_id: The project containing the runbook
+        runbook_process_id: The RunbookProcessId (e.g., "RunbookProcess-Runbooks-10021")
+
+    Returns:
+        The process dict containing Steps with nested Actions and Packages.
+    """
+    resp = await client.get(
+        f"/api/spaces/{OCTOPUS_SPACE_ID}/projects/{project_id}/runbookProcesses/{runbook_process_id}"
+    )
+    _raise_for_status(resp)
+    return resp.json()
+
+
 async def resolve_db_runbook_packages(client: httpx.AsyncClient, runbook_id: str) -> list[dict]:
     """Resolve the latest package versions for a database-backed runbook.
 
-    Fetches the runbook snapshot template, then for each required package,
-    uses the FixedVersion if specified, otherwise queries the feed for the latest version.
+    Fetches the runbook process via the project runbookProcesses endpoint,
+    extracts packages from Steps[].Actions[].Packages[], then for each required package,
+    uses the Version/FixedVersion if specified, otherwise queries the feed for the latest version.
 
     Returns:
         A list of selected package dicts with ActionName, PackageReferenceName, and Version.
     """
+    # First get the runbook to find its ProjectId and RunbookProcessId
     try:
-        template = await get_runbook_snapshot_template(client, runbook_id)
+        resp = await client.get(f"/api/{OCTOPUS_SPACE_ID}/runbooks/{runbook_id}")
+        _raise_for_status(resp)
+        runbook = resp.json()
     except Exception:
-        logger.exception("Failed to fetch runbook snapshot template for %s", runbook_id)
+        logger.exception("Failed to fetch runbook %s", runbook_id)
         return []
 
-    packages = template.get("Packages", [])
+    project_id = runbook.get("ProjectId", "")
+    runbook_process_id = runbook.get("RunbookProcessId", "")
+
+    if not project_id or not runbook_process_id:
+        logger.warning("Runbook %s missing ProjectId or RunbookProcessId", runbook_id)
+        return []
+
+    # Fetch the runbook process to get packages from Steps[].Actions[].Packages[]
+    try:
+        process = await get_db_runbook_process(client, project_id, runbook_process_id)
+    except Exception:
+        logger.exception("Failed to fetch runbook process for %s", runbook_id)
+        return []
+
+    packages = _extract_packages_from_process(process)
     if not packages:
         return []
 
@@ -360,7 +396,8 @@ async def resolve_db_runbook_packages(client: httpx.AsyncClient, runbook_id: str
     for package in packages:
         feed_id = package.get("FeedId", "")
         package_id = package.get("PackageId", "")
-        fixed_version = package.get("FixedVersion")
+        # DB runbook packages may use "Version" or "FixedVersion" for pinned versions
+        fixed_version = package.get("Version") or package.get("FixedVersion")
 
         if not package_id:
             continue
@@ -378,7 +415,7 @@ async def resolve_db_runbook_packages(client: httpx.AsyncClient, runbook_id: str
         if version:
             selected_packages.append({
                 "ActionName": package.get("ActionName", ""),
-                "PackageReferenceName": package.get("PackageReferenceName", ""),
+                "PackageReferenceName": package.get("Name", ""),
                 "Version": version,
             })
             logger.info(f"Selected package {package_id} version {version} for action {package.get('ActionName', '')}")
