@@ -35,8 +35,8 @@ from octopus import (
     get_runbook_environments,
     build_form_values,
     build_task_result,
-    octopus_headers,
     get_project_ids_by_names,
+    resolve_selected_packages,
 )
 
 base_url = os.environ.get("EASY_MODE_MCP_BASE_URL", "http://localhost:8000")
@@ -266,9 +266,14 @@ async def _run_runbook(runbook_id: str, environment_id: str, variable_values: di
             if variable_values:
                 # For CaC runbooks, map variable names directly as form values
                 form_values = dict(variable_values)
+
+            # Resolve latest package versions for the runbook
+            selected_packages = await resolve_selected_packages(client, project_id, git_ref, runbook_slug)
+
             task_id = await create_cac_runbook_run(
                 client, project_id, git_ref, runbook_slug,
                 environment_id, form_values=form_values, tenant_id=tenant_id,
+                selected_packages=selected_packages,
             )
         else:
             # Database-backed runbooks use published snapshots

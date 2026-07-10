@@ -286,7 +286,101 @@ async def create_runbook_run(client: httpx.AsyncClient, runbook_id: str, snapsho
     return run["TaskId"]
 
 
-async def create_cac_runbook_run(client: httpx.AsyncClient, project_id: str, git_ref: str, runbook_slug: str, environment_id: str, form_values: dict[str, str] | None = None, tenant_id: str | None = None) -> str:
+async def get_runbook_process_template(client: httpx.AsyncClient, project_id: str, git_ref: str, runbook_slug: str) -> dict:
+    """Fetch the runbook process template to discover required packages.
+
+    Args:
+        client: The HTTP client to use
+        project_id: The project containing the runbook
+        git_ref: The git branch name (e.g., "main")
+        runbook_slug: The runbook slug
+
+    Returns:
+        The template dict containing package information.
+    """
+    encoded_ref = f"refs/heads/{git_ref}".replace("/", "%2F")
+    resp = await client.get(
+        f"/api/{OCTOPUS_SPACE_ID}/projects/{project_id}/{encoded_ref}/runbooks/{runbook_slug}/runbookProcess/template"
+    )
+    _raise_for_status(resp)
+    return resp.json()
+
+
+async def get_latest_package_version(client: httpx.AsyncClient, feed_id: str, package_id: str) -> str:
+    """Fetch the latest version of a package from a feed.
+
+    Args:
+        client: The HTTP client to use
+        feed_id: The feed ID to query
+        package_id: The package ID to look up
+
+    Returns:
+        The latest version string for the package.
+    """
+    resp = await client.get(
+        f"/api/{OCTOPUS_SPACE_ID}/feeds/{feed_id}/packages/versions",
+        params={"packageId": package_id, "take": 1},
+    )
+    _raise_for_status(resp)
+    data = resp.json()
+    items = data.get("Items", data) if isinstance(data, dict) else data
+    if items:
+        return items[0].get("Version", "")
+    return ""
+
+
+async def resolve_selected_packages(client: httpx.AsyncClient, project_id: str, git_ref: str, runbook_slug: str) -> list[dict]:
+    """Resolve the latest package versions for a CaC runbook.
+
+    Fetches the runbook process template, then for each required package,
+    queries the feed for the latest version.
+
+    Returns:
+        A list of selected package dicts with ActionName, PackageReferenceName, and Version.
+    """
+    try:
+        template = await get_runbook_process_template(client, project_id, git_ref, runbook_slug)
+    except Exception:
+        logger.exception("Failed to fetch runbook process template for %s/%s", project_id, runbook_slug)
+        return []
+
+    packages = template.get("Packages", [])
+    if not packages:
+        return []
+
+    selected_packages = []
+    for package in packages:
+        feed_id = package.get("FeedId", "")
+        package_id = package.get("PackageId", "")
+        fixed_version = package.get("FixedVersion")
+
+        if not package_id:
+            continue
+
+        version = None
+        if fixed_version:
+            # Use the fixed version if specified
+            version = fixed_version
+            logger.info(f"Using fixed version {version} for package {package_id}")
+        elif feed_id:
+            # Otherwise, query the feed for the latest version
+            try:
+                version = await get_latest_package_version(client, feed_id, package_id)
+            except Exception:
+                logger.exception("Failed to get latest version for package %s from feed %s", package_id, feed_id)
+
+        if version:
+            selected_packages.append({
+                "ActionName": package.get("ActionName", ""),
+                "PackageReferenceName": package.get("PackageReferenceName", ""),
+                "Version": version,
+            })
+            logger.info(f"Selected package {package_id} version {version} for action {package.get('ActionName', '')}")
+
+    return selected_packages
+
+
+async def create_cac_runbook_run(client: httpx.AsyncClient, project_id: str, git_ref: str, runbook_slug: str, environment_id: str, form_values: dict[str, str] | None = None, tenant_id: str | None = None, selected_packages: list[dict] | None = None) -> str:
     """Create a config-as-code runbook run and return the task ID.
 
     Args:
@@ -297,6 +391,7 @@ async def create_cac_runbook_run(client: httpx.AsyncClient, project_id: str, git
         environment_id: The environment to run in
         form_values: Optional form values to submit with the run
         tenant_id: Optional tenant ID for tenanted runs
+        selected_packages: Optional list of selected packages with versions
 
     Returns:
         The server task ID for the created run.
@@ -320,7 +415,7 @@ async def create_cac_runbook_run(client: httpx.AsyncClient, project_id: str, git
     }
 
     payload = {
-        "SelectedPackages": [],
+        "SelectedPackages": selected_packages or [],
         "SelectedGitResources": [],
         "Runs": [run_entry],
     }
