@@ -514,17 +514,21 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
     run_tool.__signature__ = inspect.Signature(params)
     run_tool.__annotations__ = _build_tool_annotations(single_env, EnvironmentEnum, is_tenanted, multi_tenancy_mode, param_to_var)
 
-    runbook_tags = runbook.get("RunbookTags", [])
+    task_config = _resolve_task_config(runbook.get("RunbookTags", []))
+
+    mcp.tool(name=tool_name, description=description, task=task_config)(run_tool)
+
+
+def _resolve_task_config(runbook_tags: list[str]) -> TaskConfig:
+    """Determine the TaskConfig mode based on runbook tags."""
     async_tag = f"{TASK_TAG_GROUP}/{TASK_TAG_ASYNC}"
     sync_tag = f"{TASK_TAG_GROUP}/{TASK_TAG_SYNC}"
     if async_tag in runbook_tags:
-        task_config = TaskConfig(mode="required")
+        return TaskConfig(mode="required")
     elif sync_tag in runbook_tags:
-        task_config = TaskConfig(mode="forbidden")
+        return TaskConfig(mode="forbidden")
     else:
-        task_config = TaskConfig(mode="optional")
-
-    mcp.tool(name=tool_name, description=description, task=task_config)(run_tool)
+        return TaskConfig(mode="optional")
 
 
 async def _remove_all_tools() -> None:
