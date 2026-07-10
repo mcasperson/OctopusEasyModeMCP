@@ -429,6 +429,23 @@ async def get_latest_package_version(client: httpx.AsyncClient, feed_id: str, pa
     return ""
 
 
+def _extract_packages_from_process(process: dict) -> list[dict]:
+    """Extract packages from a runbook process response.
+
+    The process response nests packages inside Steps[].Actions[].Packages[].
+    Each extracted package is augmented with the ActionName from its parent action.
+    """
+    packages = []
+    for step in process.get("Steps", []):
+        for action in step.get("Actions", []):
+            action_name = action.get("Name", "")
+            for package in action.get("Packages", []):
+                pkg = dict(package)
+                pkg["ActionName"] = action_name
+                packages.append(pkg)
+    return packages
+
+
 async def resolve_selected_packages(client: httpx.AsyncClient, project_id: str, git_ref: str, runbook_slug: str) -> list[dict]:
     """Resolve the latest package versions for a CaC runbook.
 
@@ -444,7 +461,7 @@ async def resolve_selected_packages(client: httpx.AsyncClient, project_id: str, 
         logger.exception("Failed to fetch runbook process template for %s/%s", project_id, runbook_slug)
         return []
 
-    packages = template.get("Packages", [])
+    packages = _extract_packages_from_process(template)
     if not packages:
         return []
 
@@ -452,14 +469,15 @@ async def resolve_selected_packages(client: httpx.AsyncClient, project_id: str, 
     for package in packages:
         feed_id = package.get("FeedId", "")
         package_id = package.get("PackageId", "")
-        fixed_version = package.get("FixedVersion")
+        # CaC packages use "Version" field for pinned versions (not "FixedVersion")
+        fixed_version = package.get("Version") or package.get("FixedVersion")
 
         if not package_id:
             continue
 
         version = None
         if fixed_version:
-            # Use the fixed version if specified
+            # Use the fixed/pinned version if specified
             version = fixed_version
             logger.info(f"Using fixed version {version} for package {package_id}")
         elif feed_id:
@@ -472,7 +490,7 @@ async def resolve_selected_packages(client: httpx.AsyncClient, project_id: str, 
         if version:
             selected_packages.append({
                 "ActionName": package.get("ActionName", ""),
-                "PackageReferenceName": package.get("PackageReferenceName", ""),
+                "PackageReferenceName": package.get("Name", ""),
                 "Version": version,
             })
             logger.info(f"Selected package {package_id} version {version} for action {package.get('ActionName', '')}")
