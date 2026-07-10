@@ -508,7 +508,15 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
     run_tool.__signature__ = inspect.Signature(params)
     run_tool.__annotations__ = _build_tool_annotations(single_env, EnvironmentEnum, is_tenanted, multi_tenancy_mode, param_to_var)
 
-    mcp.tool(name=tool_name, description=description, task=TaskConfig(mode="required"))(run_tool)
+    runbook_tags = runbook.get("RunbookTags", [])
+    if "MCP Tasks/Async" in runbook_tags:
+        task_config = TaskConfig(mode="required")
+    elif "MCP Tasks/Sync" in runbook_tags:
+        task_config = TaskConfig(mode="forbidden")
+    else:
+        task_config = TaskConfig(mode="optional")
+
+    mcp.tool(name=tool_name, description=description, task=task_config)(run_tool)
 
 
 async def _remove_all_tools() -> None:
