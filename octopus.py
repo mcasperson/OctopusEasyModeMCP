@@ -411,20 +411,78 @@ async def get_tenant_detail(client: httpx.AsyncClient, tenant_id: str) -> dict:
     return resp.json()
 
 
+def _levenshtein_distance(s1: str, s2: str) -> int:
+    """Compute the Levenshtein distance between two strings."""
+    if len(s1) < len(s2):
+        return _levenshtein_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+    prev_row = list(range(len(s2) + 1))
+    for i, c1 in enumerate(s1):
+        curr_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = prev_row[j + 1] + 1
+            deletions = curr_row[j] + 1
+            substitutions = prev_row[j] + (c1 != c2)
+            curr_row.append(min(insertions, deletions, substitutions))
+        prev_row = curr_row
+    return prev_row[-1]
+
+
 async def resolve_tenant(client: httpx.AsyncClient, tenant_name: str, project_id: str, environment_id: str) -> tuple[str | None, str | None]:
     """Resolve a tenant name to an ID and validate it's linked to the project and environment.
+
+    Matches tenants by exact name first, then falls back to Levenshtein distance
+    matching (up to a distance of 3), then partial/substring matching (if exactly
+    one tenant matches).
 
     Returns:
         A tuple of (tenant_id, error_message). If successful, error_message is None.
     """
     tenants = await search_tenants(client, tenant_name)
 
-    # Find exact match
+    # Find exact match first
     tenant = None
     for t in tenants:
         if t["Name"].lower() == tenant_name.lower():
             tenant = t
             break
+
+    if tenant is not None:
+        logger.info(f"Exact tenant match for '{tenant_name}': '{tenant['Name']}'")
+    else:
+        # Log Levenshtein distances for all candidates
+        levenshtein_results = [
+            (t, _levenshtein_distance(t["Name"].lower(), tenant_name.lower()))
+            for t in tenants
+        ]
+        levenshtein_results.sort(key=lambda x: x[1])
+        logger.info(
+            f"Levenshtein distances for '{tenant_name}': "
+            f"{[(t['Name'], d) for t, d in levenshtein_results[:10]]}"
+        )
+
+        # Log partial/substring matches
+        partial_matches = [t for t in tenants if tenant_name.lower() in t["Name"].lower()]
+        logger.info(
+            f"Partial matches for '{tenant_name}': "
+            f"{[t['Name'] for t in partial_matches[:10]]}"
+        )
+
+        # Try Levenshtein match (distance <= 3)
+        if levenshtein_results and levenshtein_results[0][1] <= 3:
+            tenant = levenshtein_results[0][0]
+            logger.info(
+                f"Using Levenshtein match '{tenant['Name']}' "
+                f"(distance: {levenshtein_results[0][1]})"
+            )
+        # Fall back to partial/substring match
+        elif len(partial_matches) == 1:
+            tenant = partial_matches[0]
+            logger.info(f"Using partial match '{tenant['Name']}'")
+        elif len(partial_matches) > 1:
+            available = [t["Name"] for t in partial_matches[:10]]
+            return None, f"Tenant '{tenant_name}' matched multiple tenants. Please be more specific: {available}"
 
     if tenant is None:
         available = [t["Name"] for t in tenants[:10]]
