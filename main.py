@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from fastmcp import FastMCP, Context
 from fastmcp.server.context import AcceptedElicitation
+from fastmcp.server.tasks import TaskConfig
 
 from octopus import (
     OCTOPUS_URL,
@@ -507,7 +508,7 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
     run_tool.__signature__ = inspect.Signature(params)
     run_tool.__annotations__ = _build_tool_annotations(single_env, EnvironmentEnum, is_tenanted, multi_tenancy_mode, param_to_var)
 
-    mcp.tool(name=tool_name, description=description, task=True)(run_tool)
+    mcp.tool(name=tool_name, description=description, task=TaskConfig(mode="required"))(run_tool)
 
 
 async def _remove_all_tools() -> None:
