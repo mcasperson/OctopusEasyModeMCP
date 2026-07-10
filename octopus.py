@@ -400,7 +400,7 @@ async def get_runbook_process_template(client: httpx.AsyncClient, project_id: st
     """
     encoded_ref = f"refs/heads/{git_ref}".replace("/", "%2F")
     resp = await client.get(
-        f"/api/{OCTOPUS_SPACE_ID}/projects/{project_id}/{encoded_ref}/runbooks/{runbook_slug}/runbookProcess/template"
+        f"/api/spaces/{OCTOPUS_SPACE_ID}/projects/{project_id}/{encoded_ref}/runbookProcesses/{runbook_slug}"
     )
     _raise_for_status(resp)
     return resp.json()
