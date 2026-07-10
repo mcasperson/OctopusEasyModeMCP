@@ -48,6 +48,12 @@ base_url = os.environ.get("EASY_MODE_MCP_BASE_URL", "http://localhost:8000")
 AUTH_TYPE = os.environ.get("EASY_MODE_MCP_AUTH_TYPE", "google").lower()
 AUTH_ENABLED = AUTH_TYPE != "none"
 
+# Task mode tag configuration
+TASK_TAG_GROUP = os.environ.get("EASY_MODE_MCP_TASK_TAG_GROUP", "MCP Tasks")
+TASK_TAG_ASYNC = os.environ.get("EASY_MODE_MCP_TASK_TAG_ASYNC", "Async")
+TASK_TAG_SYNC = os.environ.get("EASY_MODE_MCP_TASK_TAG_SYNC", "Sync")
+TASK_TAG_SYNC_FALLBACK = os.environ.get("EASY_MODE_MCP_TASK_TAG_SYNC_FALLBACK", "Sync fallback")
+
 logging.info(f"Base URL: {base_url}")
 
 class InterventionResponse(BaseModel):
@@ -509,9 +515,11 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
     run_tool.__annotations__ = _build_tool_annotations(single_env, EnvironmentEnum, is_tenanted, multi_tenancy_mode, param_to_var)
 
     runbook_tags = runbook.get("RunbookTags", [])
-    if "MCP Tasks/Async" in runbook_tags:
+    async_tag = f"{TASK_TAG_GROUP}/{TASK_TAG_ASYNC}"
+    sync_tag = f"{TASK_TAG_GROUP}/{TASK_TAG_SYNC}"
+    if async_tag in runbook_tags:
         task_config = TaskConfig(mode="required")
-    elif "MCP Tasks/Sync" in runbook_tags:
+    elif sync_tag in runbook_tags:
         task_config = TaskConfig(mode="forbidden")
     else:
         task_config = TaskConfig(mode="optional")

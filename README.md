@@ -31,6 +31,17 @@ An MCP (Model Context Protocol) server that exposes Octopus Deploy runbooks as t
 | `EASY_MODE_MCP_AUTH_TYPE` | `google` | Authentication type: `google`, `github`, `azure`, `oauth_proxy`, or `none` |
 | `EASY_MODE_MCP_OCTOPUS_PROJECTS` | *(empty)* | Comma-separated list of project names to expose. If empty, all projects are exposed |
 
+### Task Mode Tags
+
+These variables control which Octopus runbook tags determine the MCP task mode for each tool. The tag checked is `{group}/{name}` (e.g., `MCP Tasks/Async`). Runbooks tagged with the async tag use `mode="required"` (always async), the sync tag use `mode="forbidden"` (always synchronous), and the sync-fallback tag or no tag use `mode="optional"` (client decides).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EASY_MODE_MCP_TASK_TAG_GROUP` | `MCP Tasks` | Tenant tag set (group) name used for task mode tags |
+| `EASY_MODE_MCP_TASK_TAG_ASYNC` | `Async` | Tag name within the group that sets task mode to `required` (always async) |
+| `EASY_MODE_MCP_TASK_TAG_SYNC` | `Sync` | Tag name within the group that sets task mode to `forbidden` (always synchronous) |
+| `EASY_MODE_MCP_TASK_TAG_SYNC_FALLBACK` | `Sync fallback` | Tag name within the group that sets task mode to `optional` (client decides). This is also the default when no tag is present |
+
 ### Required when auth is enabled (any type except `none`)
 
 | Variable | Description |
