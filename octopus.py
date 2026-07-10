@@ -286,6 +286,106 @@ async def create_runbook_run(client: httpx.AsyncClient, runbook_id: str, snapsho
     return run["TaskId"]
 
 
+async def get_runbook_snapshot_template(client: httpx.AsyncClient, runbook_id: str) -> dict:
+    """Fetch the runbook snapshot template to discover required packages for database-backed runbooks.
+
+    Args:
+        client: The HTTP client to use
+        runbook_id: The runbook ID
+
+    Returns:
+        The template dict containing package information.
+    """
+    resp = await client.get(
+        f"/api/{OCTOPUS_SPACE_ID}/runbooks/{runbook_id}/runbookSnapshotTemplate"
+    )
+    _raise_for_status(resp)
+    return resp.json()
+
+
+async def create_runbook_snapshot(client: httpx.AsyncClient, runbook_id: str, selected_packages: list[dict]) -> str:
+    """Create a new runbook snapshot with the specified package versions.
+
+    Args:
+        client: The HTTP client to use
+        runbook_id: The runbook ID
+        selected_packages: List of selected packages with ActionName, PackageReferenceName, and Version
+
+    Returns:
+        The new snapshot ID.
+    """
+    # Get the runbook to find the RunbookProcessId
+    resp = await client.get(f"/api/{OCTOPUS_SPACE_ID}/runbooks/{runbook_id}")
+    _raise_for_status(resp)
+    runbook = resp.json()
+
+    payload = {
+        "RunbookId": runbook_id,
+        "ProjectId": runbook.get("ProjectId", ""),
+        "RunbookProcessId": runbook.get("RunbookProcessId", ""),
+        "Name": f"Snapshot via MCP",
+        "SelectedPackages": selected_packages,
+    }
+
+    resp = await client.post(
+        f"/api/{OCTOPUS_SPACE_ID}/runbookSnapshots",
+        json=payload,
+    )
+    _raise_for_status(resp)
+    snapshot = resp.json()
+    logger.info(f"Created runbook snapshot {snapshot['Id']} for runbook {runbook_id}")
+    return snapshot["Id"]
+
+
+async def resolve_db_runbook_packages(client: httpx.AsyncClient, runbook_id: str) -> list[dict]:
+    """Resolve the latest package versions for a database-backed runbook.
+
+    Fetches the runbook snapshot template, then for each required package,
+    uses the FixedVersion if specified, otherwise queries the feed for the latest version.
+
+    Returns:
+        A list of selected package dicts with ActionName, PackageReferenceName, and Version.
+    """
+    try:
+        template = await get_runbook_snapshot_template(client, runbook_id)
+    except Exception:
+        logger.exception("Failed to fetch runbook snapshot template for %s", runbook_id)
+        return []
+
+    packages = template.get("Packages", [])
+    if not packages:
+        return []
+
+    selected_packages = []
+    for package in packages:
+        feed_id = package.get("FeedId", "")
+        package_id = package.get("PackageId", "")
+        fixed_version = package.get("FixedVersion")
+
+        if not package_id:
+            continue
+
+        version = None
+        if fixed_version:
+            version = fixed_version
+            logger.info(f"Using fixed version {version} for package {package_id}")
+        elif feed_id:
+            try:
+                version = await get_latest_package_version(client, feed_id, package_id)
+            except Exception:
+                logger.exception("Failed to get latest version for package %s from feed %s", package_id, feed_id)
+
+        if version:
+            selected_packages.append({
+                "ActionName": package.get("ActionName", ""),
+                "PackageReferenceName": package.get("PackageReferenceName", ""),
+                "Version": version,
+            })
+            logger.info(f"Selected package {package_id} version {version} for action {package.get('ActionName', '')}")
+
+    return selected_packages
+
+
 async def get_runbook_process_template(client: httpx.AsyncClient, project_id: str, git_ref: str, runbook_slug: str) -> dict:
     """Fetch the runbook process template to discover required packages.
 

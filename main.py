@@ -37,6 +37,8 @@ from octopus import (
     build_task_result,
     get_project_ids_by_names,
     resolve_selected_packages,
+    resolve_db_runbook_packages,
+    create_runbook_snapshot,
 )
 
 base_url = os.environ.get("EASY_MODE_MCP_BASE_URL", "http://localhost:8000")
@@ -276,8 +278,14 @@ async def _run_runbook(runbook_id: str, environment_id: str, variable_values: di
                 selected_packages=selected_packages,
             )
         else:
-            # Database-backed runbooks use published snapshots
-            snapshot_id = await get_published_snapshot_id(client, runbook_id)
+            # Database-backed runbooks: create a new snapshot with latest packages
+            selected_packages = await resolve_db_runbook_packages(client, runbook_id)
+            if selected_packages:
+                snapshot_id = await create_runbook_snapshot(client, runbook_id, selected_packages)
+            else:
+                # Fall back to published snapshot if no packages to resolve
+                snapshot_id = await get_published_snapshot_id(client, runbook_id)
+
             if not snapshot_id:
                 return {"status": "Failed", "error": "Runbook has no published snapshot"}
 
