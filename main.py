@@ -22,6 +22,7 @@ from octopus import (
     get_authenticated_headers,
     get_all_runbooks,
     get_project_prompted_variables,
+    get_project_branches,
     create_runbook_run,
     create_cac_runbook_run,
     get_task_raw_log,
@@ -305,7 +306,7 @@ async def _run_runbook(runbook_id: str, environment_id: str, variable_values: di
         return await _poll_task_to_completion(client, task_id, ctx)
 
 
-def _build_tool_params(single_env: bool, EnvironmentEnum, param_to_var: dict, is_tenanted: bool, multi_tenancy_mode: str) -> list[inspect.Parameter]:
+def _build_tool_params(single_env: bool, EnvironmentEnum, param_to_var: dict, is_tenanted: bool, multi_tenancy_mode: str, is_cac: bool = False, default_git_ref: str = "", BranchEnum=None) -> list[inspect.Parameter]:
     """Build the list of inspect.Parameter objects for a runbook tool."""
     if single_env:
         params = [
@@ -339,6 +340,16 @@ def _build_tool_params(single_env: bool, EnvironmentEnum, param_to_var: dict, is
             )
         )
 
+    if is_cac and BranchEnum:
+        params.append(
+            inspect.Parameter(
+                "git_ref",
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                default=default_git_ref or None,
+                annotation=BranchEnum | None,
+            )
+        )
+
     # Sort: ctx first, then required, then optional
     ctx_params = [p for p in params if p.name == "ctx"]
     required_params = [p for p in params if p.name != "ctx" and p.default is inspect.Parameter.empty]
@@ -346,7 +357,7 @@ def _build_tool_params(single_env: bool, EnvironmentEnum, param_to_var: dict, is
     return ctx_params + required_params + optional_params
 
 
-def _build_tool_docstring(description: str, project_id: str, env_help: str, single_env: bool, is_tenanted: bool, multi_tenancy_mode: str, param_to_var: dict) -> str:
+def _build_tool_docstring(description: str, project_id: str, env_help: str, single_env: bool, is_tenanted: bool, multi_tenancy_mode: str, param_to_var: dict, is_cac: bool = False, default_git_ref: str = "") -> str:
     """Build the docstring for a runbook tool."""
     if single_env:
         args_doc = ""
@@ -359,6 +370,9 @@ def _build_tool_docstring(description: str, project_id: str, env_help: str, sing
         required_str = " (required)" if var["required"] else " (optional)"
         var_desc = var["description"] or var["label"]
         args_doc += f"    {param_name}: {var_desc}{required_str}\n"
+    if is_cac:
+        default_str = f" (optional, defaults to '{default_git_ref}')" if default_git_ref else " (optional)"
+        args_doc += f"    git_ref: The git branch to use for the runbook{default_str}\n"
 
     return (
         f"{description}\n\n"
@@ -369,7 +383,7 @@ def _build_tool_docstring(description: str, project_id: str, env_help: str, sing
     )
 
 
-def _build_tool_annotations(single_env: bool, EnvironmentEnum, is_tenanted: bool, multi_tenancy_mode: str, param_to_var: dict) -> dict:
+def _build_tool_annotations(single_env: bool, EnvironmentEnum, is_tenanted: bool, multi_tenancy_mode: str, param_to_var: dict, is_cac: bool = False, BranchEnum=None) -> dict:
     """Build the __annotations__ dict for a runbook tool."""
     annotations = {"return": dict, "ctx": Context}
     if not single_env:
@@ -378,6 +392,8 @@ def _build_tool_annotations(single_env: bool, EnvironmentEnum, is_tenanted: bool
         annotations["tenant_name"] = str if multi_tenancy_mode == "Tenanted" else str | None
     for param_name, var in param_to_var.items():
         annotations[param_name] = str | None if not var["required"] else str
+    if is_cac and BranchEnum:
+        annotations["git_ref"] = BranchEnum | None
     return annotations
 
 
@@ -448,7 +464,7 @@ async def _resolve_tenant_for_tool(kwargs: dict, is_tenanted: bool, multi_tenanc
     return None, None
 
 
-def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_variables: list[dict]) -> None:
+def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_variables: list[dict], branch_names: list[str] | None = None) -> None:
     """Register a single runbook as an MCP tool with task support."""
     runbook_id = runbook["Id"]
     runbook_name = runbook["Name"]
@@ -458,7 +474,7 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
     multi_tenancy_mode = runbook.get("MultiTenancyMode", "Untenanted")
     is_tenanted = multi_tenancy_mode in ("Tenanted", "TenantedOrUntenanted")
     is_cac = not runbook.get("PublishedRunbookSnapshotId")
-    git_ref = runbook.get("_git_ref", "")
+    default_git_ref = runbook.get("_git_ref", "")
     runbook_slug = runbook.get("Slug", "")
 
     logger.info(
@@ -480,13 +496,22 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
     else:
         EnvironmentEnum = None
 
+    # Create a dynamic Enum for branch names (CaC projects only)
+    BranchEnum = None
+    if is_cac and branch_names:
+        BranchEnum = Enum(
+            f"Branch_{_sanitize_tool_name(runbook_name)}",
+            {name: name for name in branch_names},
+            type=str,
+        )
+
     # Build a mapping from sanitized param name to variable info
     param_to_var = {}
     for var in prompted_variables:
         param_name = _sanitize_param_name(var["name"])
         param_to_var[param_name] = var
 
-    params = _build_tool_params(single_env, EnvironmentEnum, param_to_var, is_tenanted, multi_tenancy_mode)
+    params = _build_tool_params(single_env, EnvironmentEnum, param_to_var, is_tenanted, multi_tenancy_mode, is_cac=is_cac, default_git_ref=default_git_ref, BranchEnum=BranchEnum)
 
     async def run_tool(**kwargs) -> dict:
         """placeholder"""
@@ -507,12 +532,14 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
         if tenant_error:
             return tenant_error
 
-        return await _run_runbook(runbook_id, env_id, variable_values if variable_values else None, ctx=ctx, tenant_id=resolved_tenant_id, project_id=project_id, is_cac=is_cac, git_ref=git_ref, runbook_slug=runbook_slug)
+        effective_git_ref = kwargs.get("git_ref", default_git_ref) if is_cac else default_git_ref
 
-    run_tool.__doc__ = _build_tool_docstring(description, project_id, env_help, single_env, is_tenanted, multi_tenancy_mode, param_to_var)
+        return await _run_runbook(runbook_id, env_id, variable_values if variable_values else None, ctx=ctx, tenant_id=resolved_tenant_id, project_id=project_id, is_cac=is_cac, git_ref=effective_git_ref, runbook_slug=runbook_slug)
+
+    run_tool.__doc__ = _build_tool_docstring(description, project_id, env_help, single_env, is_tenanted, multi_tenancy_mode, param_to_var, is_cac=is_cac, default_git_ref=default_git_ref)
     run_tool.__name__ = tool_name
     run_tool.__signature__ = inspect.Signature(params)
-    run_tool.__annotations__ = _build_tool_annotations(single_env, EnvironmentEnum, is_tenanted, multi_tenancy_mode, param_to_var)
+    run_tool.__annotations__ = _build_tool_annotations(single_env, EnvironmentEnum, is_tenanted, multi_tenancy_mode, param_to_var, is_cac=is_cac, BranchEnum=BranchEnum)
 
     task_config = _resolve_task_config(runbook.get("RunbookTags", []))
 
@@ -570,6 +597,22 @@ async def register_all_runbook_tools() -> None:
     )
     project_prompted_vars = dict(zip(project_ids, project_vars))
 
+    # Fetch git branches for CaC projects
+    cac_project_ids = [pid for pid, ref in project_git_refs.items() if ref]
+    if cac_project_ids:
+        branch_results = await asyncio.gather(
+            *[get_project_branches(pid) for pid in cac_project_ids],
+            return_exceptions=True,
+        )
+        project_branches: dict[str, list[str]] = {}
+        for pid, result in zip(cac_project_ids, branch_results):
+            if isinstance(result, Exception):
+                logger.warning(f"Failed to fetch branches for project {pid}: {result}")
+            else:
+                project_branches[pid] = result
+    else:
+        project_branches = {}
+
     # Fetch lifecycle environments for runbooks with FromProjectLifecycles scope
     lifecycle_runbooks = [rb for rb in runbooks if rb.get("EnvironmentScope") == "FromProjectLifecycles"]
     lifecycle_envs = await asyncio.gather(
@@ -598,7 +641,7 @@ async def register_all_runbook_tools() -> None:
         else:
             runbook_environments = environments
 
-        _register_runbook_tool(runbook, runbook_environments, prompted)
+        _register_runbook_tool(runbook, runbook_environments, prompted, branch_names=project_branches.get(runbook.get("ProjectId", "")))
 
 
 # Register tools at import time by running the async setup
