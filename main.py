@@ -545,6 +545,14 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
 
     mcp.tool(name=tool_name, description=description, task=task_config)(run_tool)
 
+    # If docket is already running (dynamic refresh after startup), register the
+    # new tool so background-task execution can find it by key.
+    if mcp._docket is not None:
+        tool_key = f"tool:{tool_name}@"
+        tool_obj = mcp.local_provider._components.get(tool_key)
+        if tool_obj:
+            tool_obj.register_with_docket(mcp._docket)
+
 
 def _resolve_task_config(runbook_tags: list[str]) -> TaskConfig:
     """Determine the TaskConfig mode based on runbook tags."""

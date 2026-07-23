@@ -3,6 +3,13 @@
   <component name="ProjectModuleManager">
     <modules>
       <module fileurl="file://$PROJECT_DIR$/.idea/OctopusEasyModeMCP.iml" filepath="$PROJECT_DIR$/.idea/OctopusEasyModeMCP.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/atproto-mcp.iml" filepath="$PROJECT_DIR$/.idea/atproto-mcp.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/fastmcp.iml" filepath="$PROJECT_DIR$/.idea/fastmcp.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/fastmcp-app-examples.iml" filepath="$PROJECT_DIR$/.idea/fastmcp-app-examples.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/fastmcp-remote.iml" filepath="$PROJECT_DIR$/.idea/fastmcp-remote.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/fastmcp-slim.iml" filepath="$PROJECT_DIR$/.idea/fastmcp-slim.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/smart-home.iml" filepath="$PROJECT_DIR$/.idea/smart-home.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/testing-demo.iml" filepath="$PROJECT_DIR$/.idea/testing-demo.iml" />
     </modules>
   </component>
 </project>
