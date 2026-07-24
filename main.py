@@ -319,13 +319,14 @@ def _build_tool_params(single_env: bool, EnvironmentEnum, param_to_var: dict, is
         ]
 
     for param_name, var in param_to_var.items():
-        default = var["default"] if var["default"] else (inspect.Parameter.empty if var["required"] else None)
+        # Every parameter is required (i.e. the type is a string). We pass empty values by default.
+        default = var["default"] if var["default"] else inspect.Parameter.empty
         params.append(
             inspect.Parameter(
                 param_name,
                 inspect.Parameter.POSITIONAL_OR_KEYWORD,
                 default=default,
-                annotation=str | None if not var["required"] else str,
+                annotation=str,
             )
         )
 
@@ -545,15 +546,6 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
 
     mcp.tool(name=tool_name, description=description, task=task_config)(run_tool)
 
-    # Remove additionalProperties: false from the input schema so that MCP
-    # clients that validate inputs locally don't reject unexpected properties.
-    # This solves this error when calling some runbooks:
-    # ERROR: Your input to the tool was invalid (must NOT have additional properties)
-    # Please check your input and try again.
-    tool_key = f"tool:{tool_name}@"
-    tool_obj = mcp.local_provider._components.get(tool_key)
-    if tool_obj and isinstance(tool_obj.parameters, dict):
-        tool_obj.parameters.pop("additionalProperties", None)
 
     # If docket is already running (dynamic refresh after startup), register the
     # new tool so background-task execution can find it by key.
