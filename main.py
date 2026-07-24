@@ -478,7 +478,7 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
     default_git_ref = runbook.get("_git_ref", "")
     runbook_slug = runbook.get("Slug", "")
 
-    logger.info(
+    print(
         f"Registering runbook tool: {tool_name} (runbook_id={runbook_id}, project_id={project_id}, "
         f"prompted_variables={[v['name'] for v in prompted_variables]})"
     )
