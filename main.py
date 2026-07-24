@@ -631,12 +631,13 @@ async def register_all_runbook_tools() -> None:
     for runbook in runbooks:
         all_prompted = project_prompted_vars.get(runbook.get("ProjectId", ""), [])
         runbook_id = runbook["Id"]
+        runbook_slug = runbook["Slug"]
 
         # Filter prompted variables: include only those with no ProcessOwner scope
         # or where this runbook is listed as a process owner
         prompted = [
             var for var in all_prompted
-            if not var.get("process_owners") or runbook_id in var["process_owners"]
+            if not var.get("process_owners") or runbook_id in var["process_owners"] or runbook_slug in var["process_owners"]
         ]
 
         # Filter environments based on the runbook's EnvironmentScope

@@ -294,7 +294,13 @@ async def create_runbook_run(client: httpx.AsyncClient, runbook_id: str, snapsho
         f"/api/{OCTOPUS_SPACE_ID}/runbookRuns",
         json=payload,
     )
-    _raise_for_status(resp)
+
+    try:
+        _raise_for_status(resp)
+    except httpx.HTTPStatusError:
+        logger.error(f"Failed to create runbook run: {resp.status_code} {resp.text}")
+        raise
+
     run = resp.json()
     return run["TaskId"]
 
