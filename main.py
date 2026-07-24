@@ -547,6 +547,9 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
 
     # Remove additionalProperties: false from the input schema so that MCP
     # clients that validate inputs locally don't reject unexpected properties.
+    # This solves this error when calling some runbooks:
+    # ERROR: Your input to the tool was invalid (must NOT have additional properties)
+    # Please check your input and try again.
     tool_key = f"tool:{tool_name}@"
     tool_obj = mcp.local_provider._components.get(tool_key)
     if tool_obj and isinstance(tool_obj.parameters, dict):
