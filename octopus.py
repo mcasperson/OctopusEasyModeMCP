@@ -161,8 +161,7 @@ async def _get_all_database_runbooks(client: httpx.AsyncClient) -> list[dict]:
 
 async def get_project_branches(project_id: str) -> list[str]:
     """Fetch the list of git branch names for a config-as-code project."""
-    headers = await get_authenticated_headers()
-    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=headers) as client:
+    async with httpx.AsyncClient(base_url=OCTOPUS_URL, headers=octopus_headers()) as client:
         resp = await client.get(
             f"/api/{OCTOPUS_SPACE_ID}/projects/{project_id}/git/branches",
             params={"skip": 0, "take": 2147483647},
