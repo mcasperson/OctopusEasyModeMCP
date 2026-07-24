@@ -545,6 +545,13 @@ def _register_runbook_tool(runbook: dict, environments: list[dict], prompted_var
 
     mcp.tool(name=tool_name, description=description, task=task_config)(run_tool)
 
+    # Remove additionalProperties: false from the input schema so that MCP
+    # clients that validate inputs locally don't reject unexpected properties.
+    tool_key = f"tool:{tool_name}@"
+    tool_obj = mcp.local_provider._components.get(tool_key)
+    if tool_obj and isinstance(tool_obj.parameters, dict):
+        tool_obj.parameters.pop("additionalProperties", None)
+
     # If docket is already running (dynamic refresh after startup), register the
     # new tool so background-task execution can find it by key.
     if mcp._docket is not None:
