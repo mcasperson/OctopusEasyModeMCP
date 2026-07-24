@@ -1,6 +1,6 @@
 # Octopus Easy Mode MCP Server
 
-An MCP (Model Context Protocol) server that exposes Octopus Deploy runbooks as tools. Each published runbook in your Octopus space is automatically registered as an MCP tool with appropriate parameters for environments, prompted variables, and tenants.
+An MCP (Model Context Protocol) server that exposes Octopus Deploy runbooks as tools. Each published or Config-as-Code enabled runbook in your Octopus space is automatically registered as an MCP tool with appropriate parameters for environments, prompted variables, and tenants.
 
 ## Features
 
